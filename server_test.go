@@ -312,10 +312,10 @@ func TestRegisterSchema(t *testing.T) {
 	mcp := New(gin.New(), nil)
 
 	type QueryParams struct {
-		Page int `form:"page"`
+		Page int `form:"page" description:"Page number for pagination"`
 	}
 	type Body struct {
-		Name string `json:"name"`
+		Name string `json:"name" description:"Product name"`
 	}
 
 	// Test valid registration
@@ -584,3 +584,120 @@ func TestSetupServer_NotifyToolsChanged(t *testing.T) {
 }
 
 // TODO: Add tests for executeTool using mocks
+
+func TestGinMCPWithDocs(t *testing.T) {
+	// Set Gin to test mode
+	gin.SetMode(gin.TestMode)
+
+	// Create router
+	r := gin.New()
+
+	// Register routes
+	r.GET("/products", ListProducts)
+	r.GET("/products/:id", GetProduct)
+	r.POST("/products", CreateProduct)
+
+	// Create MCP server
+	mcp := New(r, &Config{
+		Name:        "Test API",
+		Description: "Test API with docs",
+		BaseURL:     "http://localhost:8080",
+	})
+
+	// Define request and response structures
+	type ListProductsParams struct {
+		Page int `form:"page" description:"Page number for pagination"`
+	}
+
+	type Product struct {
+		Name        string  `json:"name" description:"Product name"`
+		Description string  `json:"description" description:"Product description"`
+		Price       float64 `json:"price" description:"Product price"`
+	}
+
+	// Register schemas
+	mcp.RegisterSchema("GET", "/products", ListProductsParams{}, nil)
+	mcp.RegisterSchema("GET", "/products/:id", nil, nil)
+	mcp.RegisterSchema("POST", "/products", nil, Product{})
+
+	// Mount MCP and setup server
+	mcp.Mount("/mcp")
+	err := mcp.SetupServer()
+	assert.NoError(t, err)
+
+	// Get tools list using handleToolsList directly
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"list-req-1"`),
+		Method:  "tools/list",
+	}
+
+	resp := mcp.handleToolsList(req)
+	assert.NotNil(t, resp)
+	assert.Nil(t, resp.Error)
+
+	// Get tools list from response
+	resultMap, ok := resp.Result.(map[string]interface{})
+	assert.True(t, ok)
+	assert.Contains(t, resultMap, "tools")
+	tools, ok := resultMap["tools"].([]types.Tool)
+	assert.True(t, ok)
+	assert.NotEmpty(t, tools)
+
+	// Verify tools in the list
+	for _, tool := range tools {
+		switch tool.Name {
+		case "GET_products":
+			// Verify comment conversion to description
+			assert.Contains(t, tool.Description, "Get product list")
+			assert.Contains(t, tool.Description, "Returns a paginated list of products")
+			// Verify parameter description
+			assert.NotNil(t, tool.InputSchema)
+			assert.Contains(t, tool.InputSchema.Properties["page"].Description, "Page number for pagination")
+
+		case "GET_products_id":
+			assert.Contains(t, tool.Description, "Get product details")
+			assert.Contains(t, tool.Description, "Returns detailed information for a specific product")
+			assert.NotNil(t, tool.InputSchema)
+			assert.Contains(t, tool.InputSchema.Properties["id"].Description, "Product ID")
+
+		case "POST_products":
+			assert.Contains(t, tool.Description, "Create new product")
+			assert.Contains(t, tool.Description, "Creates a new product and returns the creation result")
+			// Verify request body schema
+			assert.NotNil(t, tool.InputSchema)
+			assert.Contains(t, tool.InputSchema.Properties["name"].Description, "Product name")
+			assert.Contains(t, tool.InputSchema.Properties["description"].Description, "Product description")
+			assert.Contains(t, tool.InputSchema.Properties["price"].Description, "Product price")
+		}
+	}
+}
+
+// ListProducts handles product list retrieval
+// @summary Get product list
+// @description Returns a paginated list of products
+// @param page Page number for pagination, starting from 1
+// @return List of products
+func ListProducts(c *gin.Context) {
+	c.JSON(200, gin.H{"message": "list products"})
+}
+
+// GetProduct handles single product retrieval
+// @summary Get product details
+// @description Returns detailed information for a specific product
+// @param id Product ID
+// @return Product details
+func GetProduct(c *gin.Context) {
+	c.JSON(200, gin.H{"message": "get product"})
+}
+
+// CreateProduct handles new product creation
+// @summary Create new product
+// @description Creates a new product and returns the creation result
+// @param name Product name
+// @param description Product description
+// @param price Product price
+// @return Created product information
+func CreateProduct(c *gin.Context) {
+	c.JSON(200, gin.H{"message": "create product"})
+}

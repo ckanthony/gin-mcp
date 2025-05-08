@@ -4,7 +4,12 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
+
+	"go/ast"
+	"go/parser"
+	"go/token"
 
 	"github.com/ckanthony/gin-mcp/pkg/types"
 	"github.com/gin-gonic/gin"
@@ -32,14 +37,36 @@ func ConvertRoutesToTools(routes gin.RoutesInfo, registeredSchemas map[string]ty
 		if isDebugMode() {
 			log.Printf("Processing route: %s %s -> OpID: %s", route.Method, route.Path, operationID)
 		}
+		filePath, handlerName := getHandlerInfo(route.HandlerFunc)
+		// Parse handler function comments
+		handlerDoc, _ := parseHandlerComments(filePath, handlerName)
+
+		// Generate description information
+		description := fmt.Sprintf("Handler for %s %s", route.Method, route.Path)
+		if handlerDoc != nil {
+			if handlerDoc.Summary != "" {
+				description = handlerDoc.Summary
+			}
+			if handlerDoc.Description != "" {
+				description += "\n\n" + handlerDoc.Description
+			}
+		}
 
 		// Generate schema for the tool's input
 		inputSchema := generateInputSchema(route, registeredSchemas)
 
-		// Create the tool definition
+		// Add parameter descriptions to schema if available
+		if handlerDoc != nil && len(handlerDoc.Params) > 0 {
+			for paramName, paramDesc := range handlerDoc.Params {
+				if prop, ok := inputSchema.Properties[paramName]; ok {
+					prop.Description = paramDesc
+				}
+			}
+		}
+
 		tool := types.Tool{
 			Name:        operationID,
-			Description: fmt.Sprintf("Handler for %s %s", route.Method, route.Path), // Use route info for description
+			Description: description,
 			InputSchema: inputSchema,
 		}
 
@@ -213,4 +240,81 @@ func reflectAndAddProperties(goType interface{}, properties map[string]*types.JS
 			*required = append(*required, fieldName)
 		}
 	}
+}
+
+// HandlerDoc stores function documentation
+type HandlerDoc struct {
+	Summary     string
+	Description string
+	Params      map[string]string
+	Returns     string
+}
+
+// parseHandlerComments parses function documentation from source code
+func parseHandlerComments(filePath string, handlerName string) (*HandlerDoc, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		log.Printf("Failed to parse file %s: %v", filePath, err)
+		return nil, err
+	}
+
+	var doc *HandlerDoc
+
+	// Iterate through top-level declarations
+	for _, decl := range f.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			if fn.Name.String() == handlerName {
+				doc = &HandlerDoc{
+					Params: make(map[string]string),
+				}
+				if fn.Doc != nil {
+					// Parse comments
+					lines := strings.Split(fn.Doc.Text(), "\n")
+					for _, line := range lines {
+						line = strings.TrimSpace(line)
+						switch {
+						case strings.HasPrefix(line, "@summary"):
+							doc.Summary = strings.TrimSpace(strings.TrimPrefix(line, "@summary"))
+						case strings.HasPrefix(line, "@description"):
+							doc.Description = strings.TrimSpace(strings.TrimPrefix(line, "@description"))
+						case strings.HasPrefix(line, "@param"):
+							paramText := strings.TrimSpace(strings.TrimPrefix(line, "@param"))
+							parts := strings.SplitN(paramText, " ", 2)
+							if len(parts) == 2 {
+								paramName := strings.TrimSpace(parts[0])
+								paramDesc := strings.TrimSpace(parts[1])
+								doc.Params[paramName] = paramDesc
+							}
+						case strings.HasPrefix(line, "@return"):
+							doc.Returns = strings.TrimSpace(strings.TrimPrefix(line, "@return"))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return doc, nil
+}
+
+func getHandlerInfo(handler gin.HandlerFunc) (string, string) {
+	// Get function reflection value
+	v := reflect.ValueOf(handler)
+	ptr := v.Pointer()
+
+	// Get function name and info
+	funcInfo := runtime.FuncForPC(ptr)
+	if funcInfo == nil {
+		return "", ""
+	}
+
+	fullName := funcInfo.Name()
+	filePath, _ := funcInfo.FileLine(ptr)
+
+	// Extract short function name from full name
+	parts := strings.Split(fullName, ".")
+	shortName := parts[len(parts)-1]
+
+	return filePath, shortName
 }

@@ -2,7 +2,10 @@ package convert
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ckanthony/gin-mcp/pkg/types"
@@ -442,4 +445,137 @@ func TestReflectTypeHelper(t *testing.T) { // Assuming types.ReflectType exists 
 	assert.Equal(t, reflect.Struct, rt.Kind())
 	assert.Equal(t, reflect.Struct, prt.Kind())
 	assert.Equal(t, rt, prt, "ReflectType should return the underlying struct type for both value and pointer")
+}
+
+// handler 是我们要测试的处理函数
+// @summary 测试处理器
+// @description 这是一个用于测试的处理器
+// @param id 用户ID
+func handler(c *gin.Context) {
+	c.JSON(200, gin.H{"message": "test"})
+}
+
+func Test_getHandlerInfo(t *testing.T) {
+	// 获取handler信息
+	filePath, funcName := getHandlerInfo(handler)
+
+	t.Logf("File Path: %s", filePath)
+	t.Logf("Function Name: %s", funcName)
+
+	// 验证函数名是否包含handler
+	if funcName == "" || !strings.Contains(funcName, "handler") {
+		t.Errorf("Expected function name to contain 'handler', got %s", funcName)
+	}
+
+	// 验证文件路径是否存在
+	if filePath == "" {
+		t.Error("File path should not be empty")
+	}
+
+	// 验证文件路径是否包含.go后缀
+	if !strings.HasSuffix(filePath, ".go") {
+		t.Errorf("Expected .go file, got %s", filePath)
+	}
+}
+
+func TestParseHandlerComments(t *testing.T) {
+	// Create a temporary test file
+	tmpFile := `package test
+
+// ListProducts handles product list retrieval
+// @summary Get product list
+// @description Returns a paginated list of products
+// @param page Page number for pagination, starting from 1
+// @return List of products
+func ListProducts(c *gin.Context) {
+	// Implementation
+}
+
+// GetProduct handles single product retrieval
+// @summary Get product details
+// @description Returns detailed information for a specific product
+// @param id Product ID
+// @return Product details
+func GetProduct(c *gin.Context) {
+	// Implementation
+}
+`
+	// Create temporary file
+	tmpDir := t.TempDir()
+	tmpPath := filepath.Join(tmpDir, "handlers_test.go")
+	err := os.WriteFile(tmpPath, []byte(tmpFile), 0644)
+	assert.NoError(t, err)
+
+	// Test ListProducts function comments
+	doc, err := parseHandlerComments(tmpPath, "ListProducts")
+	assert.NoError(t, err)
+	assert.NotNil(t, doc)
+	assert.Equal(t, "Get product list", strings.TrimSpace(doc.Summary))
+	assert.Equal(t, "Returns a paginated list of products", strings.TrimSpace(doc.Description))
+	assert.Equal(t, "Page number for pagination, starting from 1", strings.TrimSpace(doc.Params["page"]))
+	assert.Equal(t, "List of products", strings.TrimSpace(doc.Returns))
+
+	// Test GetProduct function comments
+	doc, err = parseHandlerComments(tmpPath, "GetProduct")
+	assert.NoError(t, err)
+	assert.NotNil(t, doc)
+	assert.Equal(t, "Get product details", strings.TrimSpace(doc.Summary))
+	assert.Equal(t, "Returns detailed information for a specific product", strings.TrimSpace(doc.Description))
+	assert.Equal(t, "Product ID", strings.TrimSpace(doc.Params["id"]))
+	assert.Equal(t, "Product details", strings.TrimSpace(doc.Returns))
+}
+
+func TestParseHandlerComments_EdgeCases(t *testing.T) {
+	tmpFile := `package test
+
+// EmptyDoc
+//
+func EmptyDoc(c *gin.Context) {}
+
+// MalformedTags
+// @summary
+// @param
+// @return
+func MalformedTags(c *gin.Context) {}
+
+// MultipleParams test with multiple parameters
+// @summary Test multiple parameters
+// @param id User ID
+// @param name Username
+// @param age User age
+// @return User information
+func MultipleParams(c *gin.Context) {}
+`
+	// Create temporary file
+	tmpDir := t.TempDir()
+	tmpPath := filepath.Join(tmpDir, "edge_cases_test.go")
+	err := os.WriteFile(tmpPath, []byte(tmpFile), 0644)
+	assert.NoError(t, err)
+
+	// Test empty document
+	doc, err := parseHandlerComments(tmpPath, "EmptyDoc")
+	assert.NoError(t, err)
+	assert.NotNil(t, doc)
+	assert.Empty(t, doc.Summary)
+	assert.Empty(t, doc.Description)
+	assert.Empty(t, doc.Returns)
+	assert.Empty(t, doc.Params)
+
+	// Test malformed tags
+	doc, err = parseHandlerComments(tmpPath, "MalformedTags")
+	assert.NoError(t, err)
+	assert.NotNil(t, doc)
+	assert.Empty(t, doc.Summary)
+	assert.Empty(t, doc.Returns)
+	assert.Empty(t, doc.Params)
+
+	// Test multiple parameters
+	doc, err = parseHandlerComments(tmpPath, "MultipleParams")
+	assert.NoError(t, err)
+	assert.NotNil(t, doc)
+	assert.Equal(t, "Test multiple parameters", strings.TrimSpace(doc.Summary))
+	assert.Equal(t, "User ID", strings.TrimSpace(doc.Params["id"]))
+	assert.Equal(t, "Username", strings.TrimSpace(doc.Params["name"]))
+	assert.Equal(t, "User age", strings.TrimSpace(doc.Params["age"]))
+	assert.Equal(t, "User information", strings.TrimSpace(doc.Returns))
 }
