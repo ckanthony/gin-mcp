@@ -5,6 +5,8 @@
 [![codecov](https://codecov.io/gh/ckanthony/gin-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/ckanthony/gin-mcp)
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
 
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/ckanthony/gin-mcp)](https://archestra.ai/mcp-catalog/ckanthony__gin-mcp)
+
 <table border="0">
   <tr>
     <td valign="top">
