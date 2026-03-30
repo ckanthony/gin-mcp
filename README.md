@@ -47,6 +47,10 @@
 -   **Streamable HTTP Transport:** Opt in to MCP spec 2025-03-26 for stateless, load-balancer-friendly deployments with no session affinity required.
 -   **Authorization Header Forwarding:** Automatically forward the client's `Authorization` header to every internal tool-execution call, enabling MCP access to JWT-protected APIs.
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/ckanthony-gin-mcp).
+
 ## Installation
 
 ```bash
