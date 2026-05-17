@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 
 	server "github.com/ckanthony/gin-mcp"
@@ -38,7 +39,7 @@ func configureMCPForQuicknode(r *gin.Engine) {
 	resolver := server.NewQuicknodeResolver("http://localhost:8080")
 
 	// Override the default tool execution with dynamic baseURL logic
-	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		return mcp.ExecuteToolWithResolver(operationID, parameters, resolver)
 	})
 
@@ -60,7 +61,7 @@ func configureMCPForQuicknodeWithCustomEnv(r *gin.Engine) {
 
 	// Use environment-specific resolver with custom variable name
 	envResolver := server.NewEnvironmentResolver("MY_QUICKNODE_ENDPOINT", "http://localhost:8080")
-	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		return mcp.ExecuteToolWithResolver(operationID, parameters, envResolver)
 	})
 
@@ -80,7 +81,7 @@ func configureMCPForQuicknodeDirectly(r *gin.Engine) {
 	mcp.RegisterSchema("PUT", "/products/:id", nil, UpdateProductRequest{})
 
 	// Direct approach: check environment and use dynamic URL
-	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		// Try multiple environment variables in order of preference
 		userEndpoint := os.Getenv("QUICKNODE_USER_ENDPOINT")
 		if userEndpoint == "" {

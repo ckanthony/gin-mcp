@@ -1,12 +1,14 @@
 package transport
 
 import (
+	"context"
+
 	"github.com/ckanthony/gin-mcp/pkg/types"
 	"github.com/gin-gonic/gin"
 )
 
 // MessageHandler defines the function signature for handling incoming MCP messages.
-type MessageHandler func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage
+type MessageHandler func(ctx context.Context, msg *types.MCPMessage) *types.MCPMessage
 
 // Transport defines the interface for handling MCP communication over different protocols.
 type Transport interface {

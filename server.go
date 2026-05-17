@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,7 +43,7 @@ type GinMCP struct {
 	schemasMu         sync.RWMutex
 	// executeToolFunc holds the function used to execute a tool.
 	// It defaults to defaultExecuteTool but can be overridden for testing.
-	executeToolFunc func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error)
+	executeToolFunc func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error)
 }
 
 // TransportType selects the MCP transport protocol.
@@ -127,7 +128,7 @@ func New(engine *gin.Engine, config *Config) *GinMCP {
 
 // SetExecuteToolFunc allows overriding the default tool execution function.
 // This is useful for implementing dynamic baseURL resolution or custom execution logic.
-func (m *GinMCP) SetExecuteToolFunc(fn func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error)) {
+func (m *GinMCP) SetExecuteToolFunc(fn func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error)) {
 	m.executeToolFunc = fn
 }
 
@@ -276,7 +277,7 @@ func (m *GinMCP) handleMCPConnection(c *gin.Context) {
 }
 
 // handleInitialize handles the initialize request from clients
-func (m *GinMCP) handleInitialize(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
+func (m *GinMCP) handleInitialize(_ context.Context, msg *types.MCPMessage) *types.MCPMessage {
 	// Parse initialization parameters
 	params, ok := msg.Params.(map[string]interface{})
 	if !ok {
@@ -334,7 +335,7 @@ func (m *GinMCP) handleInitialize(c *gin.Context, msg *types.MCPMessage) *types.
 }
 
 // handleToolsList handles the tools/list request
-func (m *GinMCP) handleToolsList(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
+func (m *GinMCP) handleToolsList(_ context.Context, msg *types.MCPMessage) *types.MCPMessage {
 	// Ensure server is ready
 	if err := m.SetupServer(); err != nil {
 		return &types.MCPMessage{
@@ -364,7 +365,7 @@ func (m *GinMCP) handleToolsList(c *gin.Context, msg *types.MCPMessage) *types.M
 // handleLoggingSetLevel handles the logging/setLevel request.
 // gin-mcp does not implement log streaming, so this is a no-op that satisfies
 // MCP clients (e.g. Claude Inspector) that send this method on startup.
-func (m *GinMCP) handleLoggingSetLevel(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
+func (m *GinMCP) handleLoggingSetLevel(_ context.Context, msg *types.MCPMessage) *types.MCPMessage {
 	return &types.MCPMessage{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
@@ -373,7 +374,7 @@ func (m *GinMCP) handleLoggingSetLevel(c *gin.Context, msg *types.MCPMessage) *t
 }
 
 // handleToolCall handles the tools/call request
-func (m *GinMCP) handleToolCall(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
+func (m *GinMCP) handleToolCall(ctx context.Context, msg *types.MCPMessage) *types.MCPMessage {
 	// Parse parameters from the incoming MCP message
 	reqParams, ok := msg.Params.(map[string]interface{})
 	if !ok {
@@ -432,7 +433,7 @@ func (m *GinMCP) handleToolCall(c *gin.Context, msg *types.MCPMessage) *types.MC
 	}
 
 	// Execute the actual Gin endpoint via internal HTTP call
-	execResult, err := m.executeToolFunc(c, toolName, toolArgs) // Use the function field
+	execResult, err := m.executeToolFunc(ctx, toolName, toolArgs) // Use the function field
 	if err != nil {
 		// Handle execution error
 		return &types.MCPMessage{
@@ -668,7 +669,7 @@ func (m *GinMCP) executeToolWithBaseURL(operationID string, parameters map[strin
 
 // defaultExecuteTool is the default implementation for executing a tool.
 // It handles the actual invocation of the underlying Gin handler using the configured baseURL.
-func (m *GinMCP) defaultExecuteTool(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+func (m *GinMCP) defaultExecuteTool(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 	if isDebugMode() {
 		log.Printf("[Tool Execution] Starting execution of tool '%s' with parameters: %+v", operationID, parameters)
 	}

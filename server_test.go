@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -695,7 +696,7 @@ func TestHandleToolCall(t *testing.T) {
 
 	// ** Test valid tool call **
 	// Assign mock ONLY for this case
-	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, dummyTool.Name, operationID) // operationID is the tool name here
 		assert.Equal(t, "value1", parameters["param1"])
 		return map[string]interface{}{"result": "success"}, nil // Return nil error for success
@@ -793,7 +794,7 @@ func TestHandleToolCall(t *testing.T) {
 
 	// ** Test executeTool error **
 	// Assign specific error mock ONLY for this case
-	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, dummyTool.Name, operationID) // Still check the name if desired
 		return nil, fmt.Errorf("mock execution error")
 	}
@@ -814,8 +815,8 @@ func TestHandleToolCall(t *testing.T) {
 
 	// ** Test executeTool context **
 	testCtx := &gin.Context{Params: []gin.Param{{Key: "param1", Value: "value1"}}}
-	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
-		assert.Equal(t, testCtx, c)
+	mcp.executeToolFunc = func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+		assert.Equal(t, testCtx, ctx)
 		return map[string]interface{}{"result": "success"}, nil
 	}
 
@@ -1055,7 +1056,7 @@ func TestHandleToolCall_ForwardAuthHeaders(t *testing.T) {
 		mcp.operations[dummyTool.Name] = types.Operation{Method: "GET", Path: "/do"}
 
 		var capturedArgs map[string]interface{}
-		mcp.executeToolFunc = func(_ *gin.Context, _ string, params map[string]interface{}) (interface{}, error) {
+		mcp.executeToolFunc = func(ctx context.Context, _ string, params map[string]interface{}) (interface{}, error) {
 			capturedArgs = params
 			return "ok", nil
 		}
@@ -1080,7 +1081,7 @@ func TestHandleToolCall_ForwardAuthHeaders(t *testing.T) {
 		mcp.operations[dummyTool.Name] = types.Operation{Method: "GET", Path: "/do"}
 
 		var capturedArgs map[string]interface{}
-		mcp.executeToolFunc = func(_ *gin.Context, _ string, params map[string]interface{}) (interface{}, error) {
+		mcp.executeToolFunc = func(ctx context.Context, _ string, params map[string]interface{}) (interface{}, error) {
 			capturedArgs = params
 			return "ok", nil
 		}
@@ -1151,7 +1152,7 @@ func TestHandleToolCall_CustomOperationId(t *testing.T) {
 	mcp.operations[customTool.Name] = types.Operation{Method: "GET", Path: "/custom"}
 
 	// Set up mock execution function
-	mcp.executeToolFunc = func(_ *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, "myCustomToolId", operationID, "Should call with custom operation ID")
 		assert.Equal(t, "test-value", parameters["input"])
 		return map[string]interface{}{"status": "executed"}, nil
