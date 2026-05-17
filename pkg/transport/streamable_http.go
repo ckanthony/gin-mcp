@@ -274,7 +274,7 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		return
 	}
 
-	respMsg := handler(&reqMsg)
+	respMsg := handler(c, &reqMsg)
 	c.JSON(http.StatusOK, respMsg)
 }
 

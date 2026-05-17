@@ -76,7 +76,7 @@ func TestSSETransport_MountPath(t *testing.T) {
 func TestSSETransport_RegisterHandler(t *testing.T) {
 	s := setupTestSSETransport("/mcp")
 	method := "test/method"
-	handler := func(msg *types.MCPMessage) *types.MCPMessage {
+	handler := func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Result: "ok"}
 	}
 
@@ -90,7 +90,7 @@ func TestSSETransport_RegisterHandler(t *testing.T) {
 	assert.NotNil(t, registeredHandler, "Registered handler should not be nil")
 
 	// Test overwriting handler
-	newHandler := func(msg *types.MCPMessage) *types.MCPMessage {
+	newHandler := func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Result: "new ok"}
 	}
 	s.RegisterHandler(method, newHandler)
@@ -99,7 +99,7 @@ func TestSSETransport_RegisterHandler(t *testing.T) {
 	s.hMu.RUnlock()
 	assert.NotNil(t, overwrittenHandler)
 	// Comparing func pointers directly is tricky; check if behavior changed
-	resp := overwrittenHandler(&types.MCPMessage{})
+	resp := overwrittenHandler(nil, &types.MCPMessage{})
 	assert.Equal(t, "new ok", resp.Result)
 }
 
@@ -302,7 +302,7 @@ func TestSSETransport_HandleMessage_Success(t *testing.T) {
 
 	method := "test/success"
 	handlerCalled := false
-	s.RegisterHandler(method, func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler(method, func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		handlerCalled = true
 		assert.Equal(t, method, msg.Method)
 		assert.Equal(t, types.RawMessage(`"req-id-1"`), msg.ID)
@@ -339,7 +339,7 @@ func TestSSETransport_HandleMessage_NoConnectionIdHeader(t *testing.T) {
 
 	method := "test/query"
 	handlerCalled := false
-	s.RegisterHandler(method, func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler(method, func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		handlerCalled = true
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "query success"}
 	})

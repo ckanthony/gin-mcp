@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ckanthony/gin-mcp/pkg/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,7 +51,7 @@ func TestNewStreamableHTTPTransport_WithAllowedOrigins(t *testing.T) {
 func TestStreamableHTTPTransport_RegisterHandler(t *testing.T) {
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 	method := "test/method"
-	handler := func(msg *types.MCPMessage) *types.MCPMessage {
+	handler := func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Result: "ok"}
 	}
 
@@ -64,14 +65,14 @@ func TestStreamableHTTPTransport_RegisterHandler(t *testing.T) {
 	assert.NotNil(t, registeredHandler)
 
 	// Test overwriting a handler
-	newHandler := func(msg *types.MCPMessage) *types.MCPMessage {
+	newHandler := func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Result: "new ok"}
 	}
 	s.RegisterHandler(method, newHandler)
 	s.hMu.RLock()
 	overwrittenHandler, _ := s.handlers[method]
 	s.hMu.RUnlock()
-	resp := overwrittenHandler(&types.MCPMessage{})
+	resp := overwrittenHandler(nil, &types.MCPMessage{})
 	assert.Equal(t, "new ok", resp.Result)
 }
 
@@ -139,7 +140,7 @@ func TestStreamableHTTPTransport_HandleMessage_Success(t *testing.T) {
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 	method := "test/success"
 	handlerCalled := false
-	s.RegisterHandler(method, func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler(method, func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		handlerCalled = true
 		assert.Equal(t, method, msg.Method)
 		assert.Equal(t, types.RawMessage(`"req-id-1"`), msg.ID)
@@ -162,7 +163,7 @@ func TestStreamableHTTPTransport_HandleMessage_Notification(t *testing.T) {
 	// JSON-RPC messages with no ID (notifications) must return 202 Accepted with no body.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 	handlerCalled := false
-	s.RegisterHandler("notifications/cancelled", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("notifications/cancelled", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		handlerCalled = true
 		return nil
 	})
@@ -246,7 +247,7 @@ func TestStreamableHTTPTransport_HandleMessage_DisallowedOrigin(t *testing.T) {
 func TestStreamableHTTPTransport_HandleMessage_AllowedOriginPermitted(t *testing.T) {
 	allowedOrigin := "https://app.example.com"
 	s := setupTestStreamableHTTPTransport("/mcp", []string{allowedOrigin})
-	s.RegisterHandler("test/method", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/method", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
 	})
 
@@ -263,7 +264,7 @@ func TestStreamableHTTPTransport_HandleMessage_AllowedOriginPermitted(t *testing
 func TestStreamableHTTPTransport_HandleMessage_NoOriginAlwaysPermitted(t *testing.T) {
 	// Server-to-server calls without Origin header must always be allowed.
 	s := setupTestStreamableHTTPTransport("/mcp", []string{"https://allowed.example.com"})
-	s.RegisterHandler("test/method", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/method", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
 	})
 
@@ -284,7 +285,7 @@ func TestStreamableHTTPTransport_GetAuthHeader(t *testing.T) {
 	authValue := "Bearer test-token-xyz"
 
 	var capturedRequestID string
-	s.RegisterHandler("test/auth", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/auth", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		paramsMap, ok := msg.Params.(map[string]interface{})
 		require.True(t, ok, "Params should be a map")
 		id, ok := paramsMap["_mcpConnectionID"].(string)
@@ -320,7 +321,7 @@ func TestStreamableHTTPTransport_MCPConnectionID_InjectedIntoParams(t *testing.T
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 
 	var receivedParams map[string]interface{}
-	s.RegisterHandler("test/params", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/params", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		paramsMap, ok := msg.Params.(map[string]interface{})
 		require.True(t, ok)
 		receivedParams = paramsMap
@@ -344,7 +345,7 @@ func TestStreamableHTTPTransport_MCPConnectionID_InjectedWhenParamsNil(t *testin
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 
 	var receivedParams map[string]interface{}
-	s.RegisterHandler("test/nilparams", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/nilparams", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		paramsMap, ok := msg.Params.(map[string]interface{})
 		require.True(t, ok, "Params should be initialised as a map even when absent in request")
 		receivedParams = paramsMap
@@ -611,7 +612,7 @@ func TestStreamableHTTPTransport_NotifyToolsChanged_NoSessions(t *testing.T) {
 func TestStreamableHTTPTransport_ConcurrentHandleMessage(t *testing.T) {
 	// Verify that concurrent POST requests do not race on the requestAuths map.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
-	s.RegisterHandler("test/concurrent", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/concurrent", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		time.Sleep(5 * time.Millisecond) // simulate work
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
 	})
@@ -649,7 +650,7 @@ func TestStreamableHTTPTransport_ConcurrentRegisterHandler(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s.RegisterHandler(fmt.Sprintf("method/%d", i), func(msg *types.MCPMessage) *types.MCPMessage {
+			s.RegisterHandler(fmt.Sprintf("method/%d", i), func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 				return nil
 			})
 		}(i)
@@ -667,7 +668,7 @@ func TestStreamableHTTPTransport_ConcurrentRegisterHandler(t *testing.T) {
 func TestStreamableHTTPTransport_StatelessRequests(t *testing.T) {
 	// Each POST is handled independently; no prior connection needed.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
-	s.RegisterHandler("test/stateless", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/stateless", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "stateless-ok"}
 	})
 
@@ -705,7 +706,7 @@ func TestStreamableHTTPTransport_HandleMessage_CORSWildcardWhenNoAllowlist(t *te
 	// HandleMessage does not write CORS headers itself — that is the responsibility of
 	// any CORS middleware applied to the Gin router.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
-	s.RegisterHandler("test/cors", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/cors", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
 	})
 
@@ -736,7 +737,7 @@ func TestStreamableHTTPTransport_HandleMessage_ResponseDirectlyInBody(t *testing
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 
 	expectedResult := "direct-body-response"
-	s.RegisterHandler("test/direct", func(msg *types.MCPMessage) *types.MCPMessage {
+	s.RegisterHandler("test/direct", func(c *gin.Context, msg *types.MCPMessage) *types.MCPMessage {
 		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: expectedResult}
 	})
 

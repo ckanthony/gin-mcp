@@ -446,7 +446,7 @@ func TestHandleLoggingSetLevel(t *testing.T) {
 		Params:  map[string]interface{}{"level": "debug"},
 	}
 
-	resp := mcp.handleLoggingSetLevel(req)
+	resp := mcp.handleLoggingSetLevel(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Error)
@@ -464,7 +464,7 @@ func TestHandleLoggingSetLevel_InvalidLevel(t *testing.T) {
 		Params:  map[string]interface{}{"level": "trace"},
 	}
 
-	resp := mcp.handleLoggingSetLevel(req)
+	resp := mcp.handleLoggingSetLevel(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Error)
@@ -482,7 +482,7 @@ func TestHandleInitialize(t *testing.T) {
 		Params:  map[string]interface{}{"clientInfo": "testClient"},
 	}
 
-	resp := mcp.handleInitialize(req)
+	resp := mcp.handleInitialize(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Error)
@@ -506,7 +506,7 @@ func TestHandleInitialize_InvalidParams(t *testing.T) {
 		Params:  "not a map", // Invalid parameter type
 	}
 
-	resp := mcp.handleInitialize(req)
+	resp := mcp.handleInitialize(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Result)
@@ -529,7 +529,7 @@ func TestHandleInitialize_StreamableHTTP(t *testing.T) {
 		Params:  map[string]interface{}{"clientInfo": "testClient"},
 	}
 
-	resp := mcp.handleInitialize(req)
+	resp := mcp.handleInitialize(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Error)
@@ -559,7 +559,7 @@ func TestHandleToolsList(t *testing.T) {
 		Method:  "tools/list",
 	}
 
-	resp := mcp.handleToolsList(req)
+	resp := mcp.handleToolsList(nil, req)
 	assert.NotNil(t, resp)
 	assert.Equal(t, req.ID, resp.ID)
 	assert.Nil(t, resp.Error)
@@ -695,7 +695,7 @@ func TestHandleToolCall(t *testing.T) {
 
 	// ** Test valid tool call **
 	// Assign mock ONLY for this case
-	mcp.executeToolFunc = func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, dummyTool.Name, operationID) // operationID is the tool name here
 		assert.Equal(t, "value1", parameters["param1"])
 		return map[string]interface{}{"result": "success"}, nil // Return nil error for success
@@ -713,7 +713,7 @@ func TestHandleToolCall(t *testing.T) {
 		},
 	}
 
-	resp := mcp.handleToolCall(callReq)
+	resp := mcp.handleToolCall(nil, callReq)
 	assert.NotNil(t, resp)
 	assert.Nil(t, resp.Error, "Expected no error for valid call")
 	assert.Equal(t, callReq.ID, resp.ID)
@@ -748,7 +748,7 @@ func TestHandleToolCall(t *testing.T) {
 		Method:  "tools/call",
 		Params:  map[string]interface{}{"name": "nonexistent", "arguments": map[string]interface{}{}},
 	}
-	respNotFound := mcp.handleToolCall(callNotFound)
+	respNotFound := mcp.handleToolCall(nil, callNotFound)
 	assert.NotNil(t, respNotFound)
 	assert.NotNil(t, respNotFound.Error)
 	assert.Nil(t, respNotFound.Result)
@@ -765,7 +765,7 @@ func TestHandleToolCall(t *testing.T) {
 		Method:  "tools/call",
 		Params:  "not a map",
 	}
-	respInvalidParams := mcp.handleToolCall(callInvalidParams)
+	respInvalidParams := mcp.handleToolCall(nil, callInvalidParams)
 	assert.NotNil(t, respInvalidParams)
 	assert.NotNil(t, respInvalidParams.Error)
 	assert.Nil(t, respInvalidParams.Result)
@@ -782,7 +782,7 @@ func TestHandleToolCall(t *testing.T) {
 		Method:  "tools/call",
 		Params:  map[string]interface{}{"name": dummyTool.Name}, // Missing 'arguments'
 	}
-	respMissingArgs := mcp.handleToolCall(callMissingArgs)
+	respMissingArgs := mcp.handleToolCall(nil, callMissingArgs)
 	assert.NotNil(t, respMissingArgs)
 	assert.NotNil(t, respMissingArgs.Error)
 	assert.Nil(t, respMissingArgs.Result)
@@ -793,7 +793,7 @@ func TestHandleToolCall(t *testing.T) {
 
 	// ** Test executeTool error **
 	// Assign specific error mock ONLY for this case
-	mcp.executeToolFunc = func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, dummyTool.Name, operationID) // Still check the name if desired
 		return nil, fmt.Errorf("mock execution error")
 	}
@@ -803,7 +803,7 @@ func TestHandleToolCall(t *testing.T) {
 		Method:  "tools/call",
 		Params:  map[string]interface{}{"name": dummyTool.Name, "arguments": map[string]interface{}{"param1": "value1"}},
 	}
-	respExecError := mcp.handleToolCall(callExecError)
+	respExecError := mcp.handleToolCall(nil, callExecError)
 	assert.NotNil(t, respExecError)
 	assert.NotNil(t, respExecError.Error)
 	assert.Nil(t, respExecError.Result)
@@ -811,6 +811,25 @@ func TestHandleToolCall(t *testing.T) {
 	assert.True(t, ok)
 	assert.EqualValues(t, -32603, errMapEE["code"]) // Use EqualValues
 	assert.Contains(t, errMapEE["message"].(string), "mock execution error")
+
+	// ** Test executeTool context **
+	testCtx := &gin.Context{Params: []gin.Param{{Key: "param1", Value: "value1"}}}
+	mcp.executeToolFunc = func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
+		assert.Equal(t, testCtx, c)
+		return map[string]interface{}{"result": "success"}, nil
+	}
+
+	callExecCtx := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"call-6"`),
+		Method:  "tools/call",
+		Params:  map[string]interface{}{"name": dummyTool.Name, "arguments": map[string]interface{}{"param1": "value1"}},
+	}
+	respCtx := mcp.handleToolCall(testCtx, callExecCtx)
+	assert.NotNil(t, respCtx)
+	assert.Nil(t, respCtx.Error, "Expected no error for valid call")
+	assert.Equal(t, callExecCtx.ID, respCtx.ID)
+	assert.NotNil(t, respCtx.Result)
 }
 
 func TestSetupServer_NotifyToolsChanged(t *testing.T) {
@@ -928,7 +947,7 @@ func TestGinMCPWithDocs(t *testing.T) {
 		Method:  "tools/list",
 	}
 
-	resp := mcp.handleToolsList(req)
+	resp := mcp.handleToolsList(nil, req)
 	assert.NotNil(t, resp)
 	assert.Nil(t, resp.Error)
 
@@ -1036,12 +1055,12 @@ func TestHandleToolCall_ForwardAuthHeaders(t *testing.T) {
 		mcp.operations[dummyTool.Name] = types.Operation{Method: "GET", Path: "/do"}
 
 		var capturedArgs map[string]interface{}
-		mcp.executeToolFunc = func(_ string, params map[string]interface{}) (interface{}, error) {
+		mcp.executeToolFunc = func(_ *gin.Context, _ string, params map[string]interface{}) (interface{}, error) {
 			capturedArgs = params
 			return "ok", nil
 		}
 
-		resp := mcp.handleToolCall(makeReq("conn-abc"))
+		resp := mcp.handleToolCall(nil, makeReq("conn-abc"))
 		assert.Nil(t, resp.Error)
 		// _mcpConnectionID must be forwarded into toolArgs so that executeToolLogic
 		// can retrieve the auth header from the transport.
@@ -1061,12 +1080,12 @@ func TestHandleToolCall_ForwardAuthHeaders(t *testing.T) {
 		mcp.operations[dummyTool.Name] = types.Operation{Method: "GET", Path: "/do"}
 
 		var capturedArgs map[string]interface{}
-		mcp.executeToolFunc = func(_ string, params map[string]interface{}) (interface{}, error) {
+		mcp.executeToolFunc = func(_ *gin.Context, _ string, params map[string]interface{}) (interface{}, error) {
 			capturedArgs = params
 			return "ok", nil
 		}
 
-		resp := mcp.handleToolCall(makeReq("conn-xyz"))
+		resp := mcp.handleToolCall(nil, makeReq("conn-xyz"))
 		assert.Nil(t, resp.Error)
 		// _mcpConnectionID must NOT reach executeToolFunc when forwarding is disabled.
 		assert.NotContains(t, capturedArgs, "_mcpConnectionID",
@@ -1132,7 +1151,7 @@ func TestHandleToolCall_CustomOperationId(t *testing.T) {
 	mcp.operations[customTool.Name] = types.Operation{Method: "GET", Path: "/custom"}
 
 	// Set up mock execution function
-	mcp.executeToolFunc = func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.executeToolFunc = func(_ *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, "myCustomToolId", operationID, "Should call with custom operation ID")
 		assert.Equal(t, "test-value", parameters["input"])
 		return map[string]interface{}{"status": "executed"}, nil
@@ -1152,7 +1171,7 @@ func TestHandleToolCall_CustomOperationId(t *testing.T) {
 	}
 
 	// Execute and verify
-	resp := mcp.handleToolCall(callReq)
+	resp := mcp.handleToolCall(nil, callReq)
 	assert.NotNil(t, resp)
 	assert.Nil(t, resp.Error, "Should not have error for custom operation ID")
 	assert.Equal(t, callReq.ID, resp.ID)

@@ -40,7 +40,7 @@ func configureMCPForRAGFlow(r *gin.Engine) {
 	resolver := server.NewRAGFlowResolver("http://localhost:8080")
 
 	// Override the default tool execution with dynamic baseURL logic
-	mcp.SetExecuteToolFunc(func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		return mcp.ExecuteToolWithResolver(operationID, parameters, resolver)
 	})
 
@@ -62,7 +62,7 @@ func configureMCPForRAGFlowWithWorkflow(r *gin.Engine) {
 
 	// Use environment-specific resolver for workflow URLs
 	workflowResolver := server.NewEnvironmentResolver("RAGFLOW_WORKFLOW_URL", "http://localhost:8080")
-	mcp.SetExecuteToolFunc(func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		return mcp.ExecuteToolWithResolver(operationID, parameters, workflowResolver)
 	})
 
@@ -82,7 +82,7 @@ func configureMCPForRAGFlowDirectly(r *gin.Engine) {
 	mcp.RegisterSchema("PUT", "/products/:id", nil, UpdateProductRequest{})
 
 	// Direct approach: construct RAGFlow URL from components
-	mcp.SetExecuteToolFunc(func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+	mcp.SetExecuteToolFunc(func(c *gin.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		endpoint := buildRAGFlowEndpoint()
 		return mcp.ExecuteToolWithDynamicURL(operationID, parameters, endpoint)
 	})
