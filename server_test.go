@@ -814,7 +814,7 @@ func TestHandleToolCall(t *testing.T) {
 	assert.Contains(t, errMapEE["message"].(string), "mock execution error")
 
 	// ** Test executeTool context **
-	testCtx := &gin.Context{Params: []gin.Param{{Key: "param1", Value: "value1"}}}
+	testCtx := context.WithValue(context.Background(), "param1", "value1")
 	mcp.executeToolFunc = func(ctx context.Context, operationID string, parameters map[string]interface{}) (interface{}, error) {
 		assert.Equal(t, testCtx, ctx)
 		return map[string]interface{}{"result": "success"}, nil
