@@ -75,6 +75,10 @@ type Config struct {
 	// the connection is captured and included in requests to tool endpoints.
 	// Default: false (for backward compatibility)
 	ForwardAuthHeaders bool
+	// ForwardHeaders lists additional request headers to copy from the MCP request into
+	// the internal tool execution request. Header names are matched case-insensitively.
+	// Use ForwardAuthHeaders for Authorization; this slice is for extra headers.
+	ForwardHeaders []string
 	// TransportType selects the MCP transport protocol.
 	// Default: TransportTypeSSE (for backward compatibility).
 	// Use TransportTypeStreamableHTTP for horizontally-scaled deployments.
@@ -123,6 +127,82 @@ func New(engine *gin.Engine, config *Config) *GinMCP {
 	}
 
 	return m
+}
+
+var defaultAllowedHeaders = []string{
+	"Content-Type",
+	"Content-Length",
+	"Accept-Encoding",
+	"X-CSRF-Token",
+	"Authorization",
+	"accept",
+	"origin",
+	"Cache-Control",
+	"X-Requested-With",
+	"X-Connection-ID",
+}
+
+func mergeHeaderNames(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	merged := make([]string, 0, len(base)+len(extra))
+
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, name)
+	}
+
+	for _, name := range base {
+		add(name)
+	}
+	for _, name := range extra {
+		add(name)
+	}
+
+	return merged
+}
+
+func (m *GinMCP) shouldForwardHeaders() bool {
+	return m.config != nil && (m.config.ForwardAuthHeaders || len(m.config.ForwardHeaders) > 0)
+}
+
+func (m *GinMCP) forwardHeaderNames() []string {
+	if m.config == nil {
+		return nil
+	}
+
+	headers := make([]string, 0, 1+len(m.config.ForwardHeaders))
+	if m.config.ForwardAuthHeaders {
+		headers = append(headers, "Authorization")
+	}
+	headers = append(headers, m.config.ForwardHeaders...)
+	return headers
+}
+
+func (m *GinMCP) allowedRequestHeaders() []string {
+	return mergeHeaderNames(defaultAllowedHeaders, m.forwardHeaderNames())
+}
+
+func (m *GinMCP) collectForwardHeaders(connID string) http.Header {
+	headers := make(http.Header)
+	if connID == "" || m.transport == nil || !m.shouldForwardHeaders() {
+		return headers
+	}
+
+	for _, headerName := range m.forwardHeaderNames() {
+		if value := m.transport.GetHeader(connID, headerName); value != "" {
+			headers.Set(headerName, value)
+		}
+	}
+
+	return headers
 }
 
 // SetExecuteToolFunc allows overriding the default tool execution function.
@@ -193,7 +273,7 @@ func (m *GinMCP) Mount(mountPath string) {
 	if m.config.TransportType == TransportTypeStreamableHTTP {
 		m.transport = transport.NewStreamableHTTPTransport(mountPath, m.config.AllowedOrigins)
 	} else {
-		m.transport = transport.NewSSETransport(mountPath)
+		m.transport = transport.NewSSETransport(mountPath, m.forwardHeaderNames()...)
 	}
 	m.transport.RegisterHandler("initialize", m.handleInitialize)
 	m.transport.RegisterHandler("tools/list", m.handleToolsList)
@@ -210,9 +290,10 @@ func (m *GinMCP) Mount(mountPath string) {
 			if isDebugMode() {
 				log.Printf("[Middleware] Path %s matches mountPath %s. Applying headers.", c.Request.URL.Path, mountPath)
 			}
+			allowedHeaders := strings.Join(m.allowedRequestHeaders(), ", ")
 			c.Header("Access-Control-Allow-Origin", "*")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Connection-ID")
+			c.Header("Access-Control-Allow-Headers", allowedHeaders)
 			c.Header("Access-Control-Expose-Headers", "X-Connection-ID")
 
 			if c.Request.Method == "OPTIONS" {
@@ -405,7 +486,7 @@ func (m *GinMCP) handleToolCall(msg *types.MCPMessage) *types.MCPMessage {
 	}
 
 	// Inject connection ID into toolArgs for auth forwarding (if enabled)
-	if connID != "" && m.config.ForwardAuthHeaders {
+	if connID != "" && m.shouldForwardHeaders() {
 		if toolArgs == nil {
 			toolArgs = make(map[string]interface{})
 		}
@@ -702,15 +783,14 @@ func (m *GinMCP) defaultExecuteTool(operationID string, parameters map[string]in
 // with different baseURL resolution strategies
 func (m *GinMCP) executeToolLogic(operation types.Operation, parameters map[string]interface{}, baseURL string) (interface{}, error) {
 
-	// Extract connection ID for auth forwarding (if present)
-	var authHeader string
-	if m.config.ForwardAuthHeaders {
+	// Extract connection ID for header forwarding (if present)
+	var forwardedHeaders http.Header
+	if m.shouldForwardHeaders() {
 		if connIDVal, exists := parameters["_mcpConnectionID"]; exists {
 			if connID, ok := connIDVal.(string); ok && connID != "" {
-				// Get auth header from transport
-				authHeader = m.transport.GetAuthHeader(connID)
-				if isDebugMode() && authHeader != "" {
-					log.Printf("[Tool Execution] Forwarding auth header for connection %s", connID)
+				forwardedHeaders = m.collectForwardHeaders(connID)
+				if isDebugMode() && len(forwardedHeaders) > 0 {
+					log.Printf("[Tool Execution] Forwarding headers for connection %s: %+v", connID, forwardedHeaders)
 				}
 			}
 			// Remove connection ID from parameters
@@ -800,11 +880,16 @@ func (m *GinMCP) executeToolLogic(operation types.Operation, parameters map[stri
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	// Forward Authorization header if available
-	if authHeader != "" {
-		req.Header.Set("Authorization", authHeader)
+	// Forward configured headers if available.
+	for headerName, values := range forwardedHeaders {
+		if strings.EqualFold(headerName, "Accept") || strings.EqualFold(headerName, "Content-Type") {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(headerName, value)
+		}
 		if isDebugMode() {
-			log.Printf("[Tool Execution] Forwarding Authorization header")
+			log.Printf("[Tool Execution] Forwarding %s header", headerName)
 		}
 	}
 

@@ -45,7 +45,7 @@
 -   **Selective Exposure:** Filter which endpoints are exposed using operation IDs or tags.
 -   **Flexible Deployment:** Mount the MCP server within the same Gin app or deploy it separately.
 -   **Streamable HTTP Transport:** Opt in to MCP spec 2025-03-26 for stateless, load-balancer-friendly deployments with no session affinity required.
--   **Authorization Header Forwarding:** Automatically forward the client's `Authorization` header to every internal tool-execution call, enabling MCP access to JWT-protected APIs.
+-   **Header Forwarding:** Automatically forward selected client headers to every internal tool-execution call, including `Authorization` and custom request context headers.
 
 ## Installation
 
@@ -384,22 +384,25 @@ mcp := server.New(r, &server.Config{
 - Requests **without** an `Origin` header (server-to-server: `curl`, Node.js, etc.) → always allowed.
 - Empty / nil `AllowedOrigins` → all origins permitted (suitable when a Bearer token is required).
 
-### Authorization Header Forwarding
+### Header Forwarding
 
-When your Gin endpoints are protected by JWT Bearer tokens, you can forward the client's `Authorization` header to every internal tool-execution HTTP call:
+When your Gin endpoints are protected by JWT Bearer tokens or need request-scoped context headers, you can forward selected MCP request headers to every internal tool-execution HTTP call:
 
 ```go
 mcp := server.New(r, &server.Config{
     Name:               "My API",
     BaseURL:            "https://api.example.com",
     ForwardAuthHeaders: true,
+    ForwardHeaders:     []string{"X-Trace-Id", "X-Tenant-Id"},
 })
 mcp.Mount("/mcp")
 ```
 
-- **SSE transport**: the header is captured once at SSE connection time and reused for all subsequent tool calls on that connection.
-- **Streamable HTTP transport**: the header is captured per POST request (each call is independent).
-- Default: `false` (disabled, for backward compatibility).
+- **ForwardAuthHeaders** controls `Authorization` forwarding.
+- **ForwardHeaders** adds any extra headers you want copied through to internal tool calls.
+- **SSE transport**: headers are captured once at SSE connection time and reused for all subsequent tool calls on that connection.
+- **Streamable HTTP transport**: headers are captured per POST request (each call is independent).
+- Defaults: `ForwardAuthHeaders` is `false`, `ForwardHeaders` is empty.
 
 ## Connecting MCP Clients
 

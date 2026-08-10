@@ -22,6 +22,9 @@ type Transport interface {
 	// NotifyToolsChanged sends a notification to connected clients that the tool list has changed.
 	NotifyToolsChanged()
 
+	// GetHeader retrieves a request header for a connection.
+	GetHeader(connID string, headerName string) string
+
 	// GetAuthHeader retrieves the Authorization header for a connection.
 	GetAuthHeader(connID string) string
 }

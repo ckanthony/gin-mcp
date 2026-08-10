@@ -28,27 +28,70 @@ const (
 // ConnectionContext holds the context for an SSE connection
 type ConnectionContext struct {
 	Channel    chan *types.MCPMessage
-	AuthHeader string // Authorization header from the SSE connection
+	AuthHeader string      // Authorization header from the SSE connection
+	Headers    http.Header // Full header snapshot from the SSE connection
 }
 
 // SSETransport handles MCP communication over Server-Sent Events.
 type SSETransport struct {
-	mountPath   string
-	handlers    map[string]MessageHandler
-	connections map[string]*ConnectionContext
-	hMu         sync.RWMutex // Mutex for handlers map
-	cMu         sync.RWMutex // Mutex for connections map
+	mountPath      string
+	allowedHeaders []string
+	handlers       map[string]MessageHandler
+	connections    map[string]*ConnectionContext
+	hMu            sync.RWMutex // Mutex for handlers map
+	cMu            sync.RWMutex // Mutex for connections map
+}
+
+var sseDefaultAllowedHeaders = []string{
+	"Content-Type",
+	"Content-Length",
+	"Accept-Encoding",
+	"X-CSRF-Token",
+	"Authorization",
+	"accept",
+	"origin",
+	"Cache-Control",
+	"X-Requested-With",
+	"X-Connection-ID",
+}
+
+func mergeHeaders(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	merged := make([]string, 0, len(base)+len(extra))
+
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, name)
+	}
+
+	for _, name := range base {
+		add(name)
+	}
+	for _, name := range extra {
+		add(name)
+	}
+
+	return merged
 }
 
 // NewSSETransport creates a new SSETransport instance.
-func NewSSETransport(mountPath string) *SSETransport {
+func NewSSETransport(mountPath string, allowedHeaders ...string) *SSETransport {
 	if isDebugMode() {
 		log.Infof("[SSE] Creating new transport at %s", mountPath)
 	}
 	return &SSETransport{
-		mountPath:   mountPath,
-		handlers:    make(map[string]MessageHandler),
-		connections: make(map[string]*ConnectionContext),
+		mountPath:      mountPath,
+		allowedHeaders: allowedHeaders,
+		handlers:       make(map[string]MessageHandler),
+		connections:    make(map[string]*ConnectionContext),
 	}
 }
 
@@ -87,20 +130,24 @@ func (s *SSETransport) HandleConnection(c *gin.Context) {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("Access-Control-Allow-Origin", "*")
-	h.Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Connection-ID")
+	h.Set("Access-Control-Allow-Headers", strings.Join(mergeHeaders(sseDefaultAllowedHeaders, s.allowedHeaders), ", "))
 	h.Set("Access-Control-Expose-Headers", "X-Connection-ID")
 	h.Set("X-Connection-ID", connID)
 
-	// Capture Authorization header for forwarding to tool execution
-	authHeader := c.Request.Header.Get("Authorization")
+	// Capture request headers for forwarding to tool execution
+	headers := c.Request.Header.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
 
 	// Create buffered channel for messages
 	msgChan := make(chan *types.MCPMessage, 100)
 
-	// Create connection context with auth header
+	// Create connection context with request headers
 	connCtx := &ConnectionContext{
 		Channel:    msgChan,
-		AuthHeader: authHeader,
+		AuthHeader: headers.Get("Authorization"),
+		Headers:    headers,
 	}
 
 	// Add connection to registry
@@ -407,15 +454,28 @@ func (s *SSETransport) RemoveConnection(connID string) {
 	}
 }
 
-// GetAuthHeader retrieves the Authorization header for a connection.
-// Returns empty string if connection not found or no auth header was provided.
-func (s *SSETransport) GetAuthHeader(connID string) string {
+// GetHeader retrieves a header for a connection.
+// Returns empty string if connection not found or the header was not provided.
+func (s *SSETransport) GetHeader(connID string, headerName string) string {
 	s.cMu.RLock()
 	defer s.cMu.RUnlock()
 	if connCtx, exists := s.connections[connID]; exists {
-		return connCtx.AuthHeader
+		if connCtx.Headers != nil {
+			if value := connCtx.Headers.Get(headerName); value != "" {
+				return value
+			}
+		}
+		if strings.EqualFold(headerName, "Authorization") {
+			return connCtx.AuthHeader
+		}
 	}
 	return ""
+}
+
+// GetAuthHeader retrieves the Authorization header for a connection.
+// Returns empty string if connection not found or no auth header was provided.
+func (s *SSETransport) GetAuthHeader(connID string) string {
+	return s.GetHeader(connID, "Authorization")
 }
 
 // NotifyToolsChanged sends a tools/listChanged notification to all connected clients.

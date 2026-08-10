@@ -309,6 +309,37 @@ func TestStreamableHTTPTransport_GetAuthHeader(t *testing.T) {
 	assert.Empty(t, s.GetAuthHeader(capturedRequestID), "Auth header should be removed after request completes")
 }
 
+func TestStreamableHTTPTransport_GetHeader(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	authValue := "Bearer test-token-xyz"
+	traceValue := "trace-123"
+
+	var capturedRequestID string
+	s.RegisterHandler("test/header", func(msg *types.MCPMessage) *types.MCPMessage {
+		paramsMap, ok := msg.Params.(map[string]interface{})
+		require.True(t, ok, "Params should be a map")
+		id, ok := paramsMap["_mcpConnectionID"].(string)
+		require.True(t, ok, "_mcpConnectionID should be a string")
+		capturedRequestID = id
+		assert.Equal(t, authValue, s.GetHeader(id, "Authorization"), "Authorization should be retrievable inside handler")
+		assert.Equal(t, traceValue, s.GetHeader(id, "X-Trace-Id"), "Custom header should be retrievable inside handler")
+		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
+	})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"test/header","params":{}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", authValue)
+	c.Request.Header.Set("X-Trace-Id", traceValue)
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.NotEmpty(t, capturedRequestID, "Handler should have captured a request ID")
+	assert.Empty(t, s.GetHeader(capturedRequestID, "Authorization"), "Authorization should be removed after request completes")
+	assert.Empty(t, s.GetHeader(capturedRequestID, "X-Trace-Id"), "Custom headers should be removed after request completes")
+}
+
 func TestStreamableHTTPTransport_GetAuthHeader_MissingToken(t *testing.T) {
 	s := setupTestStreamableHTTPTransport("/mcp", nil)
 

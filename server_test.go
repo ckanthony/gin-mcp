@@ -3,7 +3,9 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -28,6 +30,8 @@ type mockTransport struct {
 	LastExecuteArgs   map[string]interface{}
 	// MockAuthHeader is returned by GetAuthHeader for testing ForwardAuthHeaders behaviour.
 	MockAuthHeader string
+	// MockHeaders are returned by GetHeader for generic forwarding tests.
+	MockHeaders http.Header
 }
 
 func newMockTransport() *mockTransport {
@@ -68,7 +72,21 @@ func (m *mockTransport) RemoveConnection(connID string) {
 
 func (m *mockTransport) NotifyToolsChanged() { m.NotifiedToolsChanged = true }
 
-func (m *mockTransport) GetAuthHeader(connID string) string { return m.MockAuthHeader }
+func (m *mockTransport) GetHeader(connID string, headerName string) string {
+	if m.MockHeaders != nil {
+		if value := m.MockHeaders.Get(headerName); value != "" {
+			return value
+		}
+	}
+	if strings.EqualFold(headerName, "Authorization") {
+		return m.MockAuthHeader
+	}
+	return ""
+}
+
+func (m *mockTransport) GetAuthHeader(connID string) string {
+	return m.GetHeader(connID, "Authorization")
+}
 
 // Mock executeTool behavior for handleToolCall tests
 func (m *mockTransport) executeTool(tool *types.Tool, args map[string]interface{}) interface{} {
@@ -435,6 +453,44 @@ func toolExists(tools []types.Tool, name string) bool {
 		}
 	}
 	return false
+}
+
+func TestExecuteToolLogic_ForwardConfiguredHeaders(t *testing.T) {
+	engine := gin.New()
+	mockT := newMockTransport()
+	mockT.MockHeaders = http.Header{
+		"Authorization": []string{"Bearer secret-token"},
+		"X-Trace-Id":    []string{"trace-123"},
+		"X-Tenant-Id":   []string{"tenant-9"},
+	}
+
+	mcp := New(engine, &Config{
+		ForwardAuthHeaders: true,
+		ForwardHeaders:     []string{"X-Trace-Id", "X-Tenant-Id"},
+	})
+	mcp.transport = mockT
+
+	var gotAuth, gotTrace, gotTenant string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotTrace = r.Header.Get("X-Trace-Id")
+		gotTenant = r.Header.Get("X-Tenant-Id")
+		assert.Empty(t, r.Header.Get("X-Other"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	result, err := mcp.executeToolLogic(types.Operation{Method: "POST", Path: "/echo"}, map[string]interface{}{
+		"_mcpConnectionID": "conn-abc",
+		"payload":          "value",
+	}, srv.URL)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]interface{}{"ok": true}, result)
+	assert.Equal(t, "Bearer secret-token", gotAuth)
+	assert.Equal(t, "trace-123", gotTrace)
+	assert.Equal(t, "tenant-9", gotTenant)
 }
 
 func TestHandleLoggingSetLevel(t *testing.T) {
@@ -1073,6 +1129,27 @@ func TestHandleToolCall_ForwardAuthHeaders(t *testing.T) {
 			"_mcpConnectionID should NOT be in toolArgs when ForwardAuthHeaders is disabled")
 		// Regular args must still be present and unaffected.
 		assert.Equal(t, "v1", capturedArgs["param1"])
+	})
+
+	t.Run("CustomHeadersOnly_InjectsConnID", func(t *testing.T) {
+		engine := gin.New()
+		mockT := newMockTransport()
+
+		mcp := New(engine, &Config{ForwardHeaders: []string{"X-Trace-Id"}})
+		mcp.transport = mockT
+		mcp.tools = []types.Tool{dummyTool}
+		mcp.operations[dummyTool.Name] = types.Operation{Method: "GET", Path: "/do"}
+
+		var capturedArgs map[string]interface{}
+		mcp.executeToolFunc = func(_ string, params map[string]interface{}) (interface{}, error) {
+			capturedArgs = params
+			return "ok", nil
+		}
+
+		resp := mcp.handleToolCall(makeReq("conn-trace"))
+		assert.Nil(t, resp.Error)
+		assert.Equal(t, "conn-trace", capturedArgs["_mcpConnectionID"],
+			"_mcpConnectionID should be injected when custom forwarding headers are configured")
 	})
 }
 

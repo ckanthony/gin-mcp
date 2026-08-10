@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,10 +34,11 @@ type StreamableHTTPTransport struct {
 	allowedOrigins []string // nil/empty = allow all origins
 	handlers       map[string]MessageHandler
 	hMu            sync.RWMutex
-	// Transient per-request auth headers: request UUID → Authorization header value.
+	// Transient per-request headers: request UUID → cloned request headers.
 	// Populated at the start of HandleMessage and deleted when the handler returns.
-	requestAuths map[string]string
-	rMu          sync.RWMutex
+	requestAuths   map[string]string
+	requestHeaders map[string]http.Header
+	rMu            sync.RWMutex
 	// Optional SSE sessions for server-initiated notifications: Mcp-Session-Id → session.
 	sessions map[string]*streamableSession
 	sMu      sync.RWMutex
@@ -66,6 +68,7 @@ func NewStreamableHTTPTransport(mountPath string, allowedOrigins []string) *Stre
 		allowedOrigins: allowedOrigins,
 		handlers:       make(map[string]MessageHandler),
 		requestAuths:   make(map[string]string),
+		requestHeaders: make(map[string]http.Header),
 		sessions:       make(map[string]*streamableSession),
 	}
 }
@@ -212,16 +215,21 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		return
 	}
 
-	// Assign a short-lived request ID to support auth header forwarding.
+	// Assign a short-lived request ID to support header forwarding.
 	requestID := uuid.New().String()
-	authHeader := c.Request.Header.Get("Authorization")
+	headers := c.Request.Header.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
 
 	s.rMu.Lock()
-	s.requestAuths[requestID] = authHeader
+	s.requestAuths[requestID] = headers.Get("Authorization")
+	s.requestHeaders[requestID] = headers
 	s.rMu.Unlock()
 	defer func() {
 		s.rMu.Lock()
 		delete(s.requestAuths, requestID)
+		delete(s.requestHeaders, requestID)
 		s.rMu.Unlock()
 	}()
 
@@ -246,8 +254,8 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		return
 	}
 
-	// Inject the request ID so that executeToolLogic can retrieve the auth header
-	// via GetAuthHeader(requestID) when ForwardAuthHeaders is enabled.
+	// Inject the request ID so that executeToolLogic can retrieve forwarded headers
+	// via GetHeader(requestID, ...) when header forwarding is enabled.
 	if reqMsg.Params == nil {
 		reqMsg.Params = map[string]interface{}{}
 	}
@@ -278,12 +286,24 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, respMsg)
 }
 
+// GetHeader returns a header captured during the current POST request.
+// requestID is the UUID injected as _mcpConnectionID by HandleMessage.
+func (s *StreamableHTTPTransport) GetHeader(requestID string, headerName string) string {
+	s.rMu.RLock()
+	defer s.rMu.RUnlock()
+	if headers, ok := s.requestHeaders[requestID]; ok {
+		return headers.Get(headerName)
+	}
+	if strings.EqualFold(headerName, "Authorization") {
+		return s.requestAuths[requestID]
+	}
+	return ""
+}
+
 // GetAuthHeader returns the Authorization header captured during the current POST request.
 // requestID is the UUID injected as _mcpConnectionID by HandleMessage.
 func (s *StreamableHTTPTransport) GetAuthHeader(requestID string) string {
-	s.rMu.RLock()
-	defer s.rMu.RUnlock()
-	return s.requestAuths[requestID]
+	return s.GetHeader(requestID, "Authorization")
 }
 
 // NotifyToolsChanged sends a tools/listChanged notification to all open SSE sessions.
