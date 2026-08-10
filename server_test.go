@@ -134,11 +134,13 @@ func TestMount(t *testing.T) {
 
 	// Simulate the handler registration part of Mount()
 	mcp.transport.RegisterHandler("initialize", mcp.handleInitialize)
+	mcp.transport.RegisterHandler("server/discover", mcp.handleServerDiscover)
 	mcp.transport.RegisterHandler("tools/list", mcp.handleToolsList)
 	mcp.transport.RegisterHandler("tools/call", mcp.handleToolCall)
 
 	// Check if handlers were registered on the mock
 	assert.NotNil(t, mockT.RegisteredHandlers["initialize"], "initialize handler should be registered")
+	assert.NotNil(t, mockT.RegisteredHandlers["server/discover"], "server/discover handler should be registered")
 	assert.NotNil(t, mockT.RegisteredHandlers["tools/list"], "tools/list handler should be registered")
 	assert.NotNil(t, mockT.RegisteredHandlers["tools/call"], "tools/call handler should be registered")
 
@@ -546,7 +548,7 @@ func TestHandleInitialize(t *testing.T) {
 
 	resultMap, ok := resp.Result.(map[string]interface{})
 	assert.True(t, ok)
-	assert.Equal(t, "2024-11-05", resultMap["protocolVersion"])
+	assert.Equal(t, ProtocolVersion20241105, resultMap["protocolVersion"])
 	assert.Contains(t, resultMap, "capabilities")
 	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
 	assert.True(t, ok)
@@ -593,9 +595,60 @@ func TestHandleInitialize_StreamableHTTP(t *testing.T) {
 
 	resultMap, ok := resp.Result.(map[string]interface{})
 	assert.True(t, ok)
-	assert.Equal(t, "2025-03-26", resultMap["protocolVersion"],
-		"Streamable HTTP transport must advertise protocol version 2025-03-26")
+	assert.Equal(t, ProtocolVersion20251125, resultMap["protocolVersion"],
+		"Streamable HTTP initialize should use the newest initialize-capable protocol")
 	assert.Contains(t, resultMap, "capabilities")
+	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
+	assert.True(t, ok)
+	assert.Equal(t, "MyServer", serverInfo["name"])
+}
+
+func TestHandleInitialize_StreamableHTTP_ClientVersion(t *testing.T) {
+	mcp := New(gin.New(), &Config{
+		Name:          "MyServer",
+		TransportType: TransportTypeStreamableHTTP,
+	})
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"init-sh-client"`),
+		Method:  "initialize",
+		Params:  map[string]interface{}{"protocolVersion": ProtocolVersion20250326},
+	}
+
+	resp := mcp.handleInitialize(req)
+	assert.NotNil(t, resp)
+	assert.Nil(t, resp.Error)
+
+	resultMap, ok := resp.Result.(map[string]interface{})
+	assert.True(t, ok)
+	assert.Equal(t, ProtocolVersion20250326, resultMap["protocolVersion"])
+}
+
+func TestHandleServerDiscover(t *testing.T) {
+	mcp := New(gin.New(), &Config{
+		Name:          "MyServer",
+		Description:   "My server instructions",
+		TransportType: TransportTypeStreamableHTTP,
+	})
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"discover-1"`),
+		Method:  "server/discover",
+	}
+
+	resp := mcp.handleServerDiscover(req)
+	assert.NotNil(t, resp)
+	assert.Equal(t, req.ID, resp.ID)
+	assert.Nil(t, resp.Error)
+
+	resultMap, ok := resp.Result.(map[string]interface{})
+	assert.True(t, ok)
+	assert.Equal(t, ProtocolVersion20260728, resultMap["protocolVersion"])
+	assert.Equal(t, "My server instructions", resultMap["instructions"])
+	assert.Contains(t, resultMap, "capabilities")
+	versions, ok := resultMap["supportedProtocolVersions"].([]string)
+	assert.True(t, ok)
+	assert.Contains(t, versions, ProtocolVersion20260728)
 	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
 	assert.True(t, ok)
 	assert.Equal(t, "MyServer", serverInfo["name"])

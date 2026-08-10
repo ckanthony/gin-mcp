@@ -49,6 +49,22 @@ type GinMCP struct {
 type TransportType string
 
 const (
+	// ProtocolVersion20241105 is the MCP protocol version used by older SSE clients.
+	ProtocolVersion20241105 = "2024-11-05"
+
+	// ProtocolVersion20250326 introduced Streamable HTTP transport.
+	ProtocolVersion20250326 = "2025-03-26"
+
+	// ProtocolVersion20250618 is a post-Streamable HTTP MCP protocol revision.
+	ProtocolVersion20250618 = "2025-06-18"
+
+	// ProtocolVersion20251125 is the newest initialize-capable protocol supported here.
+	ProtocolVersion20251125 = "2025-11-25"
+
+	// ProtocolVersion20260728 is the current MCP 2.0-era protocol version.
+	// It uses server/discover instead of the legacy initialize handshake.
+	ProtocolVersion20260728 = "2026-07-28"
+
 	// TransportTypeSSE uses the original SSE-based transport (MCP spec 2024-11-05).
 	// Requires a persistent GET SSE connection before POSTing messages, which means
 	// load balancers must route both requests to the same pod (session affinity needed).
@@ -90,6 +106,10 @@ type Config struct {
 	// Server-to-server requests without an Origin header are always allowed.
 	// Default: nil (all origins permitted — rely on authentication for access control).
 	AllowedOrigins []string
+	// ProtocolVersion optionally pins the MCP protocol version this server advertises.
+	// When empty, SSE defaults to 2024-11-05 and Streamable HTTP advertises the latest
+	// supported version while still accepting older client versions.
+	ProtocolVersion string
 }
 
 // New creates a new GinMCP instance
@@ -140,6 +160,10 @@ var defaultAllowedHeaders = []string{
 	"Cache-Control",
 	"X-Requested-With",
 	"X-Connection-ID",
+	"MCP-Protocol-Version",
+	"Mcp-Method",
+	"Mcp-Name",
+	"Mcp-Session-Id",
 }
 
 func mergeHeaderNames(base, extra []string) []string {
@@ -276,6 +300,7 @@ func (m *GinMCP) Mount(mountPath string) {
 		m.transport = transport.NewSSETransport(mountPath, m.forwardHeaderNames()...)
 	}
 	m.transport.RegisterHandler("initialize", m.handleInitialize)
+	m.transport.RegisterHandler("server/discover", m.handleServerDiscover)
 	m.transport.RegisterHandler("tools/list", m.handleToolsList)
 	m.transport.RegisterHandler("tools/call", m.handleToolCall)
 	m.transport.RegisterHandler("logging/setLevel", m.handleLoggingSetLevel)
@@ -356,6 +381,73 @@ func (m *GinMCP) handleMCPConnection(c *gin.Context) {
 	m.transport.HandleConnection(c)
 }
 
+func (m *GinMCP) supportedProtocolVersions() []string {
+	if m.config != nil && strings.TrimSpace(m.config.ProtocolVersion) != "" {
+		return []string{strings.TrimSpace(m.config.ProtocolVersion)}
+	}
+	if m.config != nil && m.config.TransportType == TransportTypeStreamableHTTP {
+		return []string{
+			ProtocolVersion20260728,
+			ProtocolVersion20251125,
+			ProtocolVersion20250618,
+			ProtocolVersion20250326,
+		}
+	}
+	return []string{ProtocolVersion20241105}
+}
+
+func (m *GinMCP) defaultProtocolVersion() string {
+	versions := m.supportedProtocolVersions()
+	if len(versions) == 0 {
+		return ProtocolVersion20241105
+	}
+	return versions[0]
+}
+
+func (m *GinMCP) initializeProtocolVersion(clientVersion string) string {
+	if clientVersion != "" {
+		for _, version := range m.supportedProtocolVersions() {
+			if version == clientVersion && version != ProtocolVersion20260728 {
+				return version
+			}
+		}
+	}
+	for _, version := range m.supportedProtocolVersions() {
+		if version != ProtocolVersion20260728 {
+			return version
+		}
+	}
+	return ProtocolVersion20251125
+}
+
+func (m *GinMCP) capabilities() map[string]interface{} {
+	return map[string]interface{}{
+		"tools": map[string]interface{}{
+			"enabled": true,
+			"config": map[string]interface{}{
+				"listChanged": false,
+			},
+		},
+		"prompts": map[string]interface{}{
+			"enabled": false,
+		},
+		"resources": map[string]interface{}{
+			"enabled": true,
+		},
+		"roots": map[string]interface{}{
+			"listChanged": false,
+		},
+	}
+}
+
+func (m *GinMCP) serverInfo(protocolVersion string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":       m.name,
+		"version":    protocolVersion,
+		"apiVersion": protocolVersion,
+	}
+}
+
 // handleInitialize handles the initialize request from clients
 func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 	// Parse initialization parameters
@@ -376,41 +468,37 @@ func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 		log.Printf("Received initialize request with params: %+v", params)
 	}
 
-	// Return server capabilities with correct structure.
-	// Protocol version matches the transport: Streamable HTTP uses 2025-03-26, SSE uses 2024-11-05.
-	protocolVersion := "2024-11-05"
-	if m.config.TransportType == TransportTypeStreamableHTTP {
-		protocolVersion = "2025-03-26"
-	}
+	clientVersion, _ := params["protocolVersion"].(string)
+	protocolVersion := m.initializeProtocolVersion(clientVersion)
 
 	return &types.MCPMessage{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
 		Result: map[string]interface{}{
 			"protocolVersion": protocolVersion,
-			"capabilities": map[string]interface{}{
-				"tools": map[string]interface{}{
-					"enabled": true,
-					"config": map[string]interface{}{
-						"listChanged": false,
-					},
-				},
-				"prompts": map[string]interface{}{
-					"enabled": false,
-				},
-				"resources": map[string]interface{}{
-					"enabled": true,
-				},
-				"roots": map[string]interface{}{
-					"listChanged": false,
-				},
-			},
-			"serverInfo": map[string]interface{}{
-				"name":       m.name,
-				"version":    "2024-11-05",
-				"apiVersion": "2024-11-05",
-			},
+			"capabilities":    m.capabilities(),
+			"serverInfo":      m.serverInfo(protocolVersion),
 		},
+	}
+}
+
+// handleServerDiscover handles MCP 2.0 server discovery requests.
+func (m *GinMCP) handleServerDiscover(msg *types.MCPMessage) *types.MCPMessage {
+	protocolVersion := m.defaultProtocolVersion()
+	result := map[string]interface{}{
+		"protocolVersion":           protocolVersion,
+		"supportedProtocolVersions": m.supportedProtocolVersions(),
+		"capabilities":              m.capabilities(),
+		"serverInfo":                m.serverInfo(protocolVersion),
+	}
+	if strings.TrimSpace(m.description) != "" {
+		result["instructions"] = m.description
+	}
+
+	return &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      msg.ID,
+		Result:  result,
 	}
 }
 
@@ -435,7 +523,7 @@ func (m *GinMCP) handleToolsList(msg *types.MCPMessage) *types.MCPMessage {
 		Result: map[string]interface{}{
 			"tools": m.tools,
 			"metadata": map[string]interface{}{
-				"version": "2024-11-05",
+				"version": m.defaultProtocolVersion(),
 				"count":   len(m.tools),
 			},
 		},

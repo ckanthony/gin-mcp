@@ -158,6 +158,31 @@ func TestStreamableHTTPTransport_HandleMessage_Success(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"id":"req-id-1"`)
 }
 
+func TestStreamableHTTPTransport_HandleMessage_MethodAndToolNameHeaders(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	var gotParams map[string]interface{}
+	s.RegisterHandler("tools/call", func(msg *types.MCPMessage) *types.MCPMessage {
+		var ok bool
+		gotParams, ok = msg.Params.(map[string]interface{})
+		assert.True(t, ok)
+		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
+	})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","params":{"arguments":{"id":"42"}}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Mcp-Method", "tools/call")
+	c.Request.Header.Set("Mcp-Name", "GET_users_id")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "2026-07-28", w.Header().Get("MCP-Protocol-Version"))
+	assert.Equal(t, "GET_users_id", gotParams["name"])
+	assert.Contains(t, w.Body.String(), `"result":"ok"`)
+}
+
 func TestStreamableHTTPTransport_HandleMessage_Notification(t *testing.T) {
 	// JSON-RPC messages with no ID (notifications) must return 202 Accepted with no body.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)

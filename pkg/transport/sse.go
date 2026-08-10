@@ -53,6 +53,10 @@ var sseDefaultAllowedHeaders = []string{
 	"Cache-Control",
 	"X-Requested-With",
 	"X-Connection-ID",
+	"MCP-Protocol-Version",
+	"Mcp-Method",
+	"Mcp-Name",
+	"Mcp-Session-Id",
 }
 
 func mergeHeaders(base, extra []string) []string {

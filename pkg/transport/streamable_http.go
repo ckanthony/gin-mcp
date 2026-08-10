@@ -240,6 +240,13 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		return
 	}
 
+	if reqMsg.Method == "" {
+		reqMsg.Method = c.GetHeader("Mcp-Method")
+	}
+	if c.GetHeader("MCP-Protocol-Version") != "" {
+		c.Header("MCP-Protocol-Version", c.GetHeader("MCP-Protocol-Version"))
+	}
+
 	if isDebugMode() {
 		log.Printf("[StreamableHTTP] Received method=%s id=%v", reqMsg.Method, reqMsg.ID)
 	}
@@ -261,6 +268,11 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 	}
 	if paramsMap, ok := reqMsg.Params.(map[string]interface{}); ok {
 		paramsMap["_mcpConnectionID"] = requestID
+		if reqMsg.Method == "tools/call" && paramsMap["name"] == nil {
+			if toolName := c.GetHeader("Mcp-Name"); toolName != "" {
+				paramsMap["name"] = toolName
+			}
+		}
 	}
 
 	s.hMu.RLock()
