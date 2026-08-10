@@ -479,11 +479,15 @@ func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 func (m *GinMCP) handleServerDiscover(msg *types.MCPMessage) *types.MCPMessage {
 	protocolVersion := m.defaultProtocolVersion()
 	result := map[string]interface{}{
-		"resultType":        "complete",
-		"protocolVersion":   protocolVersion,
-		"supportedVersions": m.supportedProtocolVersions(),
-		"capabilities":      m.capabilities(),
-		"serverInfo":        m.serverInfo(protocolVersion),
+		"resultType": "complete",
+		"_meta": map[string]interface{}{
+			"io.modelcontextprotocol/protocolVersion":   protocolVersion,
+			"io.modelcontextprotocol/supportedVersions": m.supportedProtocolVersions(),
+		},
+		"serverInfo": map[string]interface{}{
+			"name": m.name,
+		},
+		"capabilities": m.capabilities(),
 	}
 	if strings.TrimSpace(m.description) != "" {
 		result["instructions"] = m.description

@@ -17,6 +17,16 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	protocolVersion20250326 = "2025-03-26"
+	protocolVersion20260728 = "2026-07-28"
+
+	metaKeyProtocolVersion    = "io.modelcontextprotocol/protocolVersion"
+	metaKeyClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
+	base64HeaderValuePrefix   = "=?base64?"
+	base64HeaderValueSuffix   = "?="
+)
+
 // StreamableHTTPTransport handles MCP communication over Streamable HTTP (MCP spec 2025-03-26).
 //
 // Unlike SSE transport, this is stateless: POST requests return JSON responses directly in the
@@ -113,46 +123,72 @@ func (s *StreamableHTTPTransport) jsonRPCError(c *gin.Context, status int, id ty
 	})
 }
 
-func protocolVersionFromMeta(params interface{}) string {
+func requestMeta(params interface{}) map[string]interface{} {
 	paramsMap, ok := params.(map[string]interface{})
 	if !ok {
-		return ""
+		return nil
 	}
 	meta, ok := paramsMap["_meta"].(map[string]interface{})
 	if !ok {
+		return nil
+	}
+	return meta
+}
+
+func protocolVersionFromMeta(params interface{}) string {
+	meta := requestMeta(params)
+	if meta == nil {
 		return ""
 	}
-	version, _ := meta["protocolVersion"].(string)
+	version, _ := meta[metaKeyProtocolVersion].(string)
 	return version
 }
 
+func hasClientCapabilities(params interface{}) bool {
+	meta := requestMeta(params)
+	if meta == nil {
+		return false
+	}
+	_, ok := meta[metaKeyClientCapabilities].(map[string]interface{})
+	return ok
+}
+
 func isMCP2Request(protocolVersion string) bool {
-	return strings.Compare(protocolVersion, "2026-07-28") >= 0
+	return protocolVersion == protocolVersion20260728
 }
 
 func decodeHeaderValue(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	for _, encoding := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding} {
-		decoded, err := encoding.DecodeString(value)
-		if err == nil && isPrintableHeaderValue(string(decoded)) {
-			return string(decoded), nil
-		}
+	if !strings.HasPrefix(value, base64HeaderValuePrefix) || !strings.HasSuffix(value, base64HeaderValueSuffix) {
+		return value, nil
 	}
-	return value, nil
+	encoded := strings.TrimSuffix(strings.TrimPrefix(value, base64HeaderValuePrefix), base64HeaderValueSuffix)
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	decodedValue := string(decoded)
+	if !utf8.ValidString(decodedValue) {
+		return "", fmt.Errorf("decoded header value is not valid UTF-8")
+	}
+	return decodedValue, nil
 }
 
-func isPrintableHeaderValue(value string) bool {
+func isValidPlainHeaderValue(value string) bool {
 	if value == "" || !utf8.ValidString(value) {
-		return false
+		return value == ""
 	}
 	for _, r := range value {
-		if unicode.IsControl(r) {
+		if r == '\t' {
+			continue
+		}
+		if r < 0x20 || r > 0x7e || unicode.IsControl(r) {
 			return false
 		}
 	}
-	return true
+	return strings.TrimSpace(value) == value
 }
 
 // RegisterHandler registers a handler for a specific MCP method.
@@ -324,16 +360,25 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 
 	protocolVersion := c.GetHeader("MCP-Protocol-Version")
 	metaProtocolVersion := protocolVersionFromMeta(reqMsg.Params)
-	if protocolVersion == "" {
-		protocolVersion = metaProtocolVersion
+	if protocolVersion == "" && metaProtocolVersion == "" {
+		protocolVersion = protocolVersion20250326
 	}
-	if metaProtocolVersion != "" && protocolVersion != metaProtocolVersion {
-		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Protocol version mismatch between MCP-Protocol-Version header and _meta.protocolVersion", nil)
+	if protocolVersion == protocolVersion20260728 && metaProtocolVersion == "" {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Missing _meta.io.modelcontextprotocol/protocolVersion", nil)
+		return
+	}
+	if protocolVersion != "" && metaProtocolVersion != "" && protocolVersion != metaProtocolVersion {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Protocol version mismatch between MCP-Protocol-Version header and _meta.io.modelcontextprotocol/protocolVersion", nil)
+		return
+	}
+	if isMCP2Request(protocolVersion) && !hasClientCapabilities(reqMsg.Params) {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Missing _meta.io.modelcontextprotocol/clientCapabilities", nil)
 		return
 	}
 	if !s.supportsProtocolVersion(protocolVersion) {
 		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32022, fmt.Sprintf("Unsupported protocol version %q", protocolVersion), map[string]interface{}{
 			"supported": s.supportedProtocolVersions,
+			"requested": protocolVersion,
 		})
 		return
 	}
@@ -341,7 +386,16 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		c.Header("MCP-Protocol-Version", protocolVersion)
 	}
 
-	headerMethod, err := decodeHeaderValue(c.GetHeader("Mcp-Method"))
+	rawMethodHeader := c.GetHeader("Mcp-Method")
+	if strings.HasPrefix(rawMethodHeader, base64HeaderValuePrefix) && strings.HasSuffix(rawMethodHeader, base64HeaderValueSuffix) {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Mcp-Method header must be plain ASCII", nil)
+		return
+	}
+	if rawMethodHeader != "" && !isValidPlainHeaderValue(rawMethodHeader) {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Invalid Mcp-Method header", nil)
+		return
+	}
+	headerMethod, err := decodeHeaderValue(rawMethodHeader)
 	if err != nil {
 		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Invalid Mcp-Method header", nil)
 		return
@@ -380,7 +434,12 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 	if paramsMap, ok := reqMsg.Params.(map[string]interface{}); ok {
 		paramsMap["_mcpConnectionID"] = requestID
 		if reqMsg.Method == "tools/call" {
-			toolName, err := decodeHeaderValue(c.GetHeader("Mcp-Name"))
+			rawToolNameHeader := c.GetHeader("Mcp-Name")
+			if rawToolNameHeader != "" && !strings.HasPrefix(rawToolNameHeader, base64HeaderValuePrefix) && !isValidPlainHeaderValue(rawToolNameHeader) {
+				s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Invalid Mcp-Name header", nil)
+				return
+			}
+			toolName, err := decodeHeaderValue(rawToolNameHeader)
 			if err != nil {
 				s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Invalid Mcp-Name header", nil)
 				return
