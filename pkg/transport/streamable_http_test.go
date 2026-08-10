@@ -183,6 +183,125 @@ func TestStreamableHTTPTransport_HandleMessage_MethodAndToolNameHeaders(t *testi
 	assert.Contains(t, w.Body.String(), `"result":"ok"`)
 }
 
+func TestStreamableHTTPTransport_HandleMessage_MCP2RequiresMethodHeader(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+	s.RegisterHandler("tools/list", func(msg *types.MCPMessage) *types.MCPMessage {
+		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
+	})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Missing Mcp-Method header")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2MethodHeaderMismatch(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	c.Request.Header.Set("Mcp-Method", "server/discover")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Mcp-Method header does not match")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2ProtocolVersionMismatch(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{"_meta":{"protocolVersion":"2025-03-26"}}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	c.Request.Header.Set("Mcp-Method", "tools/list")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Protocol version mismatch")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2UnsupportedProtocolVersion(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28"})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "1900-01-01")
+	c.Request.Header.Set("Mcp-Method", "tools/list")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Unsupported protocol version")
+	assert.Contains(t, w.Body.String(), "2026-07-28")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2RequiresToolNameHeader(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+	s.RegisterHandler("tools/call", func(msg *types.MCPMessage) *types.MCPMessage {
+		return &types.MCPMessage{Jsonrpc: "2.0", ID: msg.ID, Result: "ok"}
+	})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"GET_users_id","arguments":{}}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	c.Request.Header.Set("Mcp-Method", "tools/call")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Missing Mcp-Name header")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2ToolNameHeaderMismatch(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+
+	reqBody := `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"body_tool","arguments":{}}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	c.Request.Header.Set("Mcp-Method", "tools/call")
+	c.Request.Header.Set("Mcp-Name", "header_tool")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Mcp-Name header does not match")
+}
+
+func TestStreamableHTTPTransport_HandleMessage_MCP2HandlerNotFoundUses404(t *testing.T) {
+	s := setupTestStreamableHTTPTransport("/mcp", nil)
+	s.SetSupportedProtocolVersions([]string{"2026-07-28", "2025-03-26"})
+
+	reqBody := `{"jsonrpc":"2.0","id":"req-id-nf","method":"unregistered/method","params":{}}`
+	c, w, _ := setupTestGinContext("POST", "/mcp", bytes.NewBufferString(reqBody), nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	c.Request.Header.Set("Mcp-Method", "unregistered/method")
+
+	s.HandleMessage(c)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), `"code":-32601`)
+}
+
 func TestStreamableHTTPTransport_HandleMessage_Notification(t *testing.T) {
 	// JSON-RPC messages with no ID (notifications) must return 202 Accepted with no body.
 	s := setupTestStreamableHTTPTransport("/mcp", nil)

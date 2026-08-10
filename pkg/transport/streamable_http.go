@@ -1,12 +1,15 @@
 package transport
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dolfly/gin-mcp/pkg/types"
 	"github.com/gin-gonic/gin"
@@ -30,10 +33,11 @@ import (
 // value is not in the allowlist is rejected with 403 Forbidden. This prevents DNS rebinding
 // attacks. Server-to-server calls that omit the Origin header are always permitted.
 type StreamableHTTPTransport struct {
-	mountPath      string
-	allowedOrigins []string // nil/empty = allow all origins
-	handlers       map[string]MessageHandler
-	hMu            sync.RWMutex
+	mountPath                 string
+	allowedOrigins            []string // nil/empty = allow all origins
+	supportedProtocolVersions []string
+	handlers                  map[string]MessageHandler
+	hMu                       sync.RWMutex
 	// Transient per-request headers: request UUID → cloned request headers.
 	// Populated at the start of HandleMessage and deleted when the handler returns.
 	requestAuths   map[string]string
@@ -71,6 +75,84 @@ func NewStreamableHTTPTransport(mountPath string, allowedOrigins []string) *Stre
 		requestHeaders: make(map[string]http.Header),
 		sessions:       make(map[string]*streamableSession),
 	}
+}
+
+// SetSupportedProtocolVersions configures the protocol versions accepted by the transport.
+func (s *StreamableHTTPTransport) SetSupportedProtocolVersions(versions []string) {
+	s.hMu.Lock()
+	defer s.hMu.Unlock()
+	s.supportedProtocolVersions = append([]string(nil), versions...)
+}
+
+func (s *StreamableHTTPTransport) supportsProtocolVersion(version string) bool {
+	s.hMu.RLock()
+	defer s.hMu.RUnlock()
+	if version == "" || len(s.supportedProtocolVersions) == 0 {
+		return true
+	}
+	for _, supported := range s.supportedProtocolVersions {
+		if supported == version {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *StreamableHTTPTransport) jsonRPCError(c *gin.Context, status int, id types.RawMessage, code int, message string, data interface{}) {
+	errorObj := map[string]interface{}{
+		"code":    code,
+		"message": message,
+	}
+	if data != nil {
+		errorObj["data"] = data
+	}
+	c.JSON(status, &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      id,
+		Error:   errorObj,
+	})
+}
+
+func protocolVersionFromMeta(params interface{}) string {
+	paramsMap, ok := params.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	meta, ok := paramsMap["_meta"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	version, _ := meta["protocolVersion"].(string)
+	return version
+}
+
+func isMCP2Request(protocolVersion string) bool {
+	return strings.Compare(protocolVersion, "2026-07-28") >= 0
+}
+
+func decodeHeaderValue(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	for _, encoding := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding} {
+		decoded, err := encoding.DecodeString(value)
+		if err == nil && isPrintableHeaderValue(string(decoded)) {
+			return string(decoded), nil
+		}
+	}
+	return value, nil
+}
+
+func isPrintableHeaderValue(value string) bool {
+	if value == "" || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // RegisterHandler registers a handler for a specific MCP method.
@@ -240,11 +322,40 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		return
 	}
 
-	if reqMsg.Method == "" {
-		reqMsg.Method = c.GetHeader("Mcp-Method")
+	protocolVersion := c.GetHeader("MCP-Protocol-Version")
+	metaProtocolVersion := protocolVersionFromMeta(reqMsg.Params)
+	if protocolVersion == "" {
+		protocolVersion = metaProtocolVersion
 	}
-	if c.GetHeader("MCP-Protocol-Version") != "" {
-		c.Header("MCP-Protocol-Version", c.GetHeader("MCP-Protocol-Version"))
+	if metaProtocolVersion != "" && protocolVersion != metaProtocolVersion {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32020, "Protocol version mismatch between MCP-Protocol-Version header and _meta.protocolVersion", nil)
+		return
+	}
+	if !s.supportsProtocolVersion(protocolVersion) {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32022, fmt.Sprintf("Unsupported protocol version %q", protocolVersion), map[string]interface{}{
+			"supported": s.supportedProtocolVersions,
+		})
+		return
+	}
+	if protocolVersion != "" {
+		c.Header("MCP-Protocol-Version", protocolVersion)
+	}
+
+	headerMethod, err := decodeHeaderValue(c.GetHeader("Mcp-Method"))
+	if err != nil {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Invalid Mcp-Method header", nil)
+		return
+	}
+	if isMCP2Request(protocolVersion) && headerMethod == "" {
+		s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Missing Mcp-Method header", nil)
+		return
+	}
+	if headerMethod != "" {
+		if reqMsg.Method != "" && reqMsg.Method != headerMethod {
+			s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Mcp-Method header does not match JSON-RPC method", nil)
+			return
+		}
+		reqMsg.Method = headerMethod
 	}
 
 	if isDebugMode() {
@@ -268,8 +379,22 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 	}
 	if paramsMap, ok := reqMsg.Params.(map[string]interface{}); ok {
 		paramsMap["_mcpConnectionID"] = requestID
-		if reqMsg.Method == "tools/call" && paramsMap["name"] == nil {
-			if toolName := c.GetHeader("Mcp-Name"); toolName != "" {
+		if reqMsg.Method == "tools/call" {
+			toolName, err := decodeHeaderValue(c.GetHeader("Mcp-Name"))
+			if err != nil {
+				s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Invalid Mcp-Name header", nil)
+				return
+			}
+			bodyName, _ := paramsMap["name"].(string)
+			if isMCP2Request(protocolVersion) && toolName == "" {
+				s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Missing Mcp-Name header", nil)
+				return
+			}
+			if toolName != "" {
+				if bodyName != "" && bodyName != toolName {
+					s.jsonRPCError(c, http.StatusBadRequest, reqMsg.ID, -32600, "Mcp-Name header does not match tool name", nil)
+					return
+				}
 				paramsMap["name"] = toolName
 			}
 		}
@@ -283,14 +408,11 @@ func (s *StreamableHTTPTransport) HandleMessage(c *gin.Context) {
 		if isDebugMode() {
 			log.Printf("[StreamableHTTP] No handler for method: %s", reqMsg.Method)
 		}
-		c.JSON(http.StatusOK, &types.MCPMessage{
-			Jsonrpc: "2.0",
-			ID:      reqMsg.ID,
-			Error: map[string]interface{}{
-				"code":    -32601,
-				"message": fmt.Sprintf("Method '%s' not found", reqMsg.Method),
-			},
-		})
+		status := http.StatusOK
+		if isMCP2Request(protocolVersion) {
+			status = http.StatusNotFound
+		}
+		s.jsonRPCError(c, status, reqMsg.ID, -32601, fmt.Sprintf("Method '%s' not found", reqMsg.Method), nil)
 		return
 	}
 

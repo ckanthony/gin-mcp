@@ -645,8 +645,9 @@ func TestHandleServerDiscover(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, ProtocolVersion20260728, resultMap["protocolVersion"])
 	assert.Equal(t, "My server instructions", resultMap["instructions"])
+	assert.Equal(t, "complete", resultMap["resultType"])
 	assert.Contains(t, resultMap, "capabilities")
-	versions, ok := resultMap["supportedProtocolVersions"].([]string)
+	versions, ok := resultMap["supportedVersions"].([]string)
 	assert.True(t, ok)
 	assert.Contains(t, versions, ProtocolVersion20260728)
 	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
@@ -676,6 +677,7 @@ func TestHandleToolsList(t *testing.T) {
 
 	resultMap, ok := resp.Result.(map[string]interface{})
 	assert.True(t, ok)
+	assert.Equal(t, "complete", resultMap["resultType"])
 	assert.Contains(t, resultMap, "tools")
 	toolsList, ok := resultMap["tools"].([]types.Tool)
 	assert.True(t, ok)

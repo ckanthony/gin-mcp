@@ -295,7 +295,9 @@ func (m *GinMCP) Mount(mountPath string) {
 
 	// 2. Create transport and register handlers
 	if m.config.TransportType == TransportTypeStreamableHTTP {
-		m.transport = transport.NewStreamableHTTPTransport(mountPath, m.config.AllowedOrigins)
+		streamable := transport.NewStreamableHTTPTransport(mountPath, m.config.AllowedOrigins)
+		streamable.SetSupportedProtocolVersions(m.supportedProtocolVersions())
+		m.transport = streamable
 	} else {
 		m.transport = transport.NewSSETransport(mountPath, m.forwardHeaderNames()...)
 	}
@@ -423,20 +425,11 @@ func (m *GinMCP) initializeProtocolVersion(clientVersion string) string {
 func (m *GinMCP) capabilities() map[string]interface{} {
 	return map[string]interface{}{
 		"tools": map[string]interface{}{
-			"enabled": true,
-			"config": map[string]interface{}{
-				"listChanged": false,
-			},
-		},
-		"prompts": map[string]interface{}{
-			"enabled": false,
-		},
-		"resources": map[string]interface{}{
-			"enabled": true,
-		},
-		"roots": map[string]interface{}{
 			"listChanged": false,
 		},
+		"resources": map[string]interface{}{},
+		"prompts":   map[string]interface{}{},
+		"logging":   map[string]interface{}{},
 	}
 }
 
@@ -486,10 +479,11 @@ func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 func (m *GinMCP) handleServerDiscover(msg *types.MCPMessage) *types.MCPMessage {
 	protocolVersion := m.defaultProtocolVersion()
 	result := map[string]interface{}{
-		"protocolVersion":           protocolVersion,
-		"supportedProtocolVersions": m.supportedProtocolVersions(),
-		"capabilities":              m.capabilities(),
-		"serverInfo":                m.serverInfo(protocolVersion),
+		"resultType":        "complete",
+		"protocolVersion":   protocolVersion,
+		"supportedVersions": m.supportedProtocolVersions(),
+		"capabilities":      m.capabilities(),
+		"serverInfo":        m.serverInfo(protocolVersion),
 	}
 	if strings.TrimSpace(m.description) != "" {
 		result["instructions"] = m.description
@@ -521,7 +515,8 @@ func (m *GinMCP) handleToolsList(msg *types.MCPMessage) *types.MCPMessage {
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
 		Result: map[string]interface{}{
-			"tools": m.tools,
+			"resultType": "complete",
+			"tools":      m.tools,
 			"metadata": map[string]interface{}{
 				"version": m.defaultProtocolVersion(),
 				"count":   len(m.tools),
@@ -633,14 +628,14 @@ func (m *GinMCP) handleToolCall(msg *types.MCPMessage) *types.MCPMessage {
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
 		Result: map[string]interface{}{ // Standard MCP result wrapper
+			"resultType": "complete",
 			"content": []map[string]interface{}{ // Content is an array
 				{
 					"type": string(types.ContentTypeText), // Assuming text response
 					"text": string(resultBytes),           // Actual result as JSON string
 				},
 			},
-			// Add other potential fields like isError=false if needed by spec/client
-			// "isError": false,
+			"isError": false,
 		},
 	}
 }
