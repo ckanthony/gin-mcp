@@ -337,7 +337,7 @@ func (s *SSETransport) HandleMessage(c *gin.Context) {
 	}
 
 	// Execute handler and send response
-	respMsg := handler(&reqMsg)
+	respMsg := handler(c.Request.Context(), &reqMsg)
 	if ok := s.trySendMessage(connID, msgChan, respMsg); ok {
 		c.Status(http.StatusOK) // Changed from 204 to 200 for mcphost compatibility
 	} else {
