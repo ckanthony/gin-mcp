@@ -44,7 +44,7 @@
 -   **Customizable Schemas:** Manually register schemas for specific routes using `RegisterSchema` for fine-grained control.
 -   **Selective Exposure:** Filter which endpoints are exposed using operation IDs or tags.
 -   **Flexible Deployment:** Mount the MCP server within the same Gin app or deploy it separately.
--   **Streamable HTTP Transport:** Opt in to MCP spec 2025-03-26 for stateless, load-balancer-friendly deployments with no session affinity required.
+-   **Modern MCP Transport:** Streamable HTTP (default) with protocol version negotiation (2026-07-28 through 2025-03-26), up-front `server/discover`, and a legacy HTTP+SSE opt-out.
 -   **Authorization Header Forwarding:** Automatically forward the client's `Authorization` header to every internal tool-execution call, enabling MCP access to JWT-protected APIs.
 
 ## Installation
@@ -348,37 +348,61 @@ mcp.SetExecuteToolFunc(func(operationID string, parameters map[string]interface{
 
 This eliminates the need for static BaseURL configuration at startup, perfect for multi-tenant proxy environments!
 
-### Streamable HTTP Transport (horizontal scaling)
+### MCP Transport & Protocol Versions
 
-By default, Gin-MCP uses the **SSE transport** (MCP spec 2024-11-05), which requires a persistent GET connection to be routed to the **same pod** as subsequent POST requests. This forces load balancers to use session affinity (sticky sessions), which is incompatible with horizontal autoscaling and unsupported by many managed load balancers (e.g. GCP, AWS ALB).
+> **Breaking change:** the default transport is now **Streamable HTTP**. The legacy HTTP+SSE transport (protocol version `2024-11-05`, deprecated by the MCP spec) is still available as an opt-out via `TransportType: server.TransportTypeSSE`.
 
-The **Streamable HTTP transport** (MCP spec 2025-03-26) solves this: every POST returns the JSON-RPC response directly in the HTTP body. No prior GET connection or pod affinity is required.
+Gin-MCP speaks the modern, stateless MCP Streamable HTTP transport by default: every POST to the mount path returns the JSON-RPC response directly in the HTTP body — no persistent GET connection or pod affinity required, which makes it compatible with horizontal autoscaling and managed load balancers (e.g. GCP, AWS ALB) that cannot do session affinity. An optional GET endpoint provides SSE sessions for server-initiated notifications (e.g. `tools/listChanged`); it is not required for basic request-response operation.
+
+The legacy **SSE transport** (MCP spec 2024-11-05) requires a persistent GET connection routed to the **same pod** as subsequent POST requests, forcing sticky sessions — opt out into it only if your client cannot speak Streamable HTTP.
+
+**Supported protocol versions** (Streamable HTTP, newest first):
+
+| Version | Notes |
+|---|---|
+| `2026-07-28` | Current. Stateless: no `initialize` handshake. Per-request `_meta` carries `io.modelcontextprotocol/protocolVersion` and `clientCapabilities`; `Mcp-Method`/`Mcp-Name` headers are validated (see below). |
+| `2025-11-25` | Last version with an `initialize` handshake. |
+| `2025-06-18` | Supported. |
+| `2025-03-26` | Supported; also the fallback when a request carries no version at all. |
+| `2024-11-05` | Legacy HTTP+SSE only (deprecated). |
 
 ```go
 mcp := server.New(r, &server.Config{
-    Name:          "My API",
-    BaseURL:       "https://api.example.com",
-    TransportType: server.TransportTypeStreamableHTTP,
+    Name:        "My API",
+    Description: "An example API exposed via MCP.",
+    BaseURL:     "https://api.example.com",
+
+    // Transport selection (default: Streamable HTTP).
+    TransportType: server.TransportTypeStreamableHTTP, // or server.TransportTypeSSE
+
+    // DNS-rebinding protection: requests with an Origin header not in this list
+    // get HTTP 403. Empty = allow all. Requests without an Origin header
+    // (server-to-server) are always allowed.
+    AllowedOrigins: []string{"https://app.example.com"},
+
+    // Pin a single protocol version. Empty = all versions supported by the transport.
+    ProtocolVersion: "",
+
+    // Advertised in serverInfo (default "0.1.0").
+    ServerVersion: "1.0.0",
+
+    // Cache hints advertised on tools/list for 2026-07-28 clients
+    // (defaults: 60000 ms, "public").
+    CacheTTLMs: 60000,
+    CacheScope: "public",
 })
 mcp.Mount("/mcp")
 ```
 
 MCP clients connect with a single `POST /mcp` — no prior GET needed.
 
+**Version negotiation.** The protocol version is resolved from the `MCP-Protocol-Version` header and `params._meta["io.modelcontextprotocol/protocolVersion"]`. If both are present they must match (else HTTP 400, `-32020`). If neither is present, `2025-03-26` is assumed. An unsupported version is rejected with HTTP 400 and `-32022`, with the `error.data.supported` list telling the client what this server speaks. Clients can also call the `server/discover` RPC up-front to get `supportedVersions`, `capabilities`, and server info without any handshake. The legacy `initialize` handshake never negotiates `2026-07-28` — it falls back to `2025-11-25`, the last handshake-capable version.
+
+**2026-07-28 header validation.** Requests negotiated as `2026-07-28` must also send an `Mcp-Method` header (plain ASCII) matching the JSON-RPC `method`, and — for `tools/call` — an `Mcp-Name` header matching `params.name`. `Mcp-Name` values that are not header-safe may be sent base64-encoded with the `=?base64?...?=` sentinel and are decoded server-side. Any missing, invalid, or mismatched header is rejected with HTTP 400 and `-32020`.
+
 #### Origin validation (DNS rebinding protection)
 
-Per [MCP spec 2025-03-26 §Security](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#security-considerations), servers should validate the `Origin` header. Use `AllowedOrigins` to restrict browser-originated requests:
-
-```go
-mcp := server.New(r, &server.Config{
-    Name:          "My API",
-    BaseURL:       "https://api.example.com",
-    TransportType: server.TransportTypeStreamableHTTP,
-    // Only allow requests from this browser origin.
-    // Omit (or leave nil) when authentication already prevents unauthorised access.
-    AllowedOrigins: []string{"https://app.example.com"},
-})
-```
+Per [MCP spec 2025-03-26 §Security](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#security-considerations), servers should validate the `Origin` header. Use `AllowedOrigins` to restrict browser-originated requests (see config example above):
 
 - Requests **with** an `Origin` header not in the list → `403 Forbidden`.
 - Requests **without** an `Origin` header (server-to-server: `curl`, Node.js, etc.) → always allowed.
@@ -407,8 +431,8 @@ Once your Gin application with Gin-MCP is running:
 
 1.  Start your application.
 2.  In your MCP client, provide the URL where you mounted the MCP server (e.g., `http://localhost:8080/mcp`):
-    - **SSE transport (default)**: connect as an SSE endpoint (GET then POST to the same path).
-    - **Streamable HTTP transport**: connect as a plain HTTP endpoint (POST only).
+    - **Streamable HTTP transport (default)**: connect as a plain HTTP endpoint (POST only).
+    - **SSE transport** (only when explicitly configured via `TransportType: server.TransportTypeSSE`): connect as an SSE endpoint (GET then POST to the same path).
     - **Cursor**: Settings → MCP → Add Server
     - **Claude Desktop**: Add to MCP configuration file
     - **Continue**: Configure in VS Code settings

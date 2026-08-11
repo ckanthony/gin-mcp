@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sync"
 	"testing"
@@ -11,6 +14,7 @@ import (
 	"github.com/ckanthony/gin-mcp/pkg/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- Mock Transport for Testing ---
@@ -490,11 +494,90 @@ func TestHandleInitialize(t *testing.T) {
 
 	resultMap, ok := resp.Result.(map[string]interface{})
 	assert.True(t, ok)
-	assert.Equal(t, "2024-11-05", resultMap["protocolVersion"])
+	// Default transport is Streamable HTTP; no version requested -> newest initialize-capable.
+	assert.Equal(t, ProtocolVersion20251125, resultMap["protocolVersion"])
 	assert.Contains(t, resultMap, "capabilities")
 	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
 	assert.True(t, ok)
 	assert.Equal(t, "MyServer", serverInfo["name"])
+	assert.Equal(t, "0.1.0", serverInfo["version"])
+	assert.NotContains(t, serverInfo, "apiVersion")
+	// Only tools capability is advertised.
+	caps, ok := resultMap["capabilities"].(map[string]interface{})
+	assert.True(t, ok)
+	assert.Contains(t, caps, "tools")
+	assert.NotContains(t, caps, "resources")
+	assert.NotContains(t, caps, "prompts")
+	assert.NotContains(t, caps, "logging")
+}
+
+func TestHandleInitialize_Negotiation(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    *Config
+		requested string
+		want      string
+	}{
+		{
+			name:      "echo supported legacy version (SSE)",
+			config:    &Config{Name: "s", TransportType: TransportTypeSSE},
+			requested: ProtocolVersion20241105,
+			want:      ProtocolVersion20241105,
+		},
+		{
+			name:      "SSE fallback for unknown requested version",
+			config:    &Config{Name: "s", TransportType: TransportTypeSSE},
+			requested: "1999-01-01",
+			want:      ProtocolVersion20241105,
+		},
+		{
+			name:      "echo supported streamable legacy version",
+			config:    &Config{Name: "s"},
+			requested: ProtocolVersion20250326,
+			want:      ProtocolVersion20250326,
+		},
+		{
+			name:      "never negotiate 2026-07-28 even when requested",
+			config:    &Config{Name: "s"},
+			requested: ProtocolVersion20260728,
+			want:      ProtocolVersion20251125,
+		},
+		{
+			name:      "unknown requested falls back to newest initialize-capable",
+			config:    &Config{Name: "s"},
+			requested: "1999-01-01",
+			want:      ProtocolVersion20251125,
+		},
+		{
+			name:      "pinned legacy version echoes pinned",
+			config:    &Config{Name: "s", ProtocolVersion: ProtocolVersion20250618},
+			requested: ProtocolVersion20250618,
+			want:      ProtocolVersion20250618,
+		},
+		{
+			name:      "pinned 2026-07-28 falls back to last initialize-capable version",
+			config:    &Config{Name: "s", ProtocolVersion: ProtocolVersion20260728},
+			requested: ProtocolVersion20260728,
+			want:      ProtocolVersion20251125,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mcp := New(gin.New(), tt.config)
+			req := &types.MCPMessage{
+				Jsonrpc: "2.0",
+				ID:      types.RawMessage(`"init-1"`),
+				Method:  "initialize",
+				Params:  map[string]interface{}{"protocolVersion": tt.requested},
+			}
+			resp := mcp.handleInitialize(req)
+			require.Nil(t, resp.Error)
+			resultMap, ok := resp.Result.(map[string]interface{})
+			require.True(t, ok)
+			assert.Equal(t, tt.want, resultMap["protocolVersion"])
+		})
+	}
 }
 
 func TestHandleInitialize_InvalidParams(t *testing.T) {
@@ -515,34 +598,6 @@ func TestHandleInitialize_InvalidParams(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, -32602, errMap["code"].(int))
 	assert.Contains(t, errMap["message"].(string), "Invalid parameters format")
-}
-
-func TestHandleInitialize_StreamableHTTP(t *testing.T) {
-	mcp := New(gin.New(), &Config{
-		Name:          "MyServer",
-		TransportType: TransportTypeStreamableHTTP,
-	})
-	req := &types.MCPMessage{
-		Jsonrpc: "2.0",
-		ID:      types.RawMessage(`"init-sh-1"`),
-		Method:  "initialize",
-		Params:  map[string]interface{}{"clientInfo": "testClient"},
-	}
-
-	resp := mcp.handleInitialize(req)
-	assert.NotNil(t, resp)
-	assert.Equal(t, req.ID, resp.ID)
-	assert.Nil(t, resp.Error)
-	assert.NotNil(t, resp.Result)
-
-	resultMap, ok := resp.Result.(map[string]interface{})
-	assert.True(t, ok)
-	assert.Equal(t, "2025-03-26", resultMap["protocolVersion"],
-		"Streamable HTTP transport must advertise protocol version 2025-03-26")
-	assert.Contains(t, resultMap, "capabilities")
-	serverInfo, ok := resultMap["serverInfo"].(map[string]interface{})
-	assert.True(t, ok)
-	assert.Equal(t, "MyServer", serverInfo["name"])
 }
 
 func TestHandleToolsList(t *testing.T) {
@@ -1170,4 +1225,327 @@ func TestHandleToolCall_CustomOperationId(t *testing.T) {
 	actualText, ok := contentItem["text"].(string)
 	assert.True(t, ok)
 	assert.JSONEq(t, `{"status":"executed"}`, actualText)
+}
+
+func TestDefaultTransportIsStreamableHTTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/things", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	mcp := New(engine, &Config{Name: "DefaultTransport"})
+	mcp.Mount("/mcp")
+
+	_, isStreamable := mcp.transport.(*transport.StreamableHTTPTransport)
+	assert.True(t, isStreamable, "default transport should be StreamableHTTPTransport")
+	assert.Equal(t, TransportTypeStreamableHTTP, mcp.config.TransportType)
+
+	// GET on the mount path is the Streamable HTTP SSE-session endpoint: without an
+	// Mcp-Session-Id header it returns 400 (not gin 404).
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	// DELETE is not routed.
+	w = httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/mcp", nil))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestSSETransportOptOut(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/things", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	mcp := New(engine, &Config{Name: "SSE", TransportType: TransportTypeSSE})
+	mcp.Mount("/mcp")
+
+	_, isSSE := mcp.transport.(*transport.SSETransport)
+	assert.True(t, isSSE, "TransportTypeSSE should select SSETransport")
+	assert.Equal(t, []string{ProtocolVersion20241105}, mcp.supportedProtocolVersions())
+}
+
+func TestSupportedProtocolVersions(t *testing.T) {
+	// Streamable default: all four, newest first.
+	mcp := New(gin.New(), &Config{Name: "s"})
+	assert.Equal(t, []string{
+		ProtocolVersion20260728,
+		ProtocolVersion20251125,
+		ProtocolVersion20250618,
+		ProtocolVersion20250326,
+	}, mcp.supportedProtocolVersions())
+
+	// Pinned version.
+	mcpPinned := New(gin.New(), &Config{Name: "s", ProtocolVersion: ProtocolVersion20250618})
+	assert.Equal(t, []string{ProtocolVersion20250618}, mcpPinned.supportedProtocolVersions())
+}
+
+func mcp2Params(extra map[string]interface{}) map[string]interface{} {
+	params := map[string]interface{}{
+		"_meta": map[string]interface{}{
+			"io.modelcontextprotocol/protocolVersion":    ProtocolVersion20260728,
+			"io.modelcontextprotocol/clientCapabilities": map[string]interface{}{},
+		},
+	}
+	for k, v := range extra {
+		params[k] = v
+	}
+	return params
+}
+
+func TestHandleServerDiscover(t *testing.T) {
+	mcp := New(gin.New(), &Config{
+		Name:          "DiscoverServer",
+		Description:   "A discoverable server",
+		ServerVersion: "1.2.3",
+	})
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"discover-1"`),
+		Method:  "server/discover",
+		Params:  mcp2Params(nil),
+	}
+
+	resp := mcp.handleServerDiscover(req)
+	require.NotNil(t, resp)
+	require.Nil(t, resp.Error)
+	require.Equal(t, req.ID, resp.ID)
+
+	resultMap, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "complete", resultMap["resultType"])
+	assert.Equal(t, "A discoverable server", resultMap["instructions"])
+
+	// supportedVersions is TOP-LEVEL in the result.
+	versions, ok := resultMap["supportedVersions"].([]string)
+	require.True(t, ok, "supportedVersions should be top-level []string")
+	assert.Equal(t, mcp.supportedProtocolVersions(), versions)
+
+	// serverInfo lives inside result._meta.
+	meta, ok := resultMap["_meta"].(map[string]interface{})
+	require.True(t, ok)
+	serverInfo, ok := meta["io.modelcontextprotocol/serverInfo"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "DiscoverServer", serverInfo["name"])
+	assert.Equal(t, "1.2.3", serverInfo["version"])
+
+	caps, ok := resultMap["capabilities"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Contains(t, caps, "tools")
+
+	// No description -> no instructions key.
+	mcpNoDesc := New(gin.New(), &Config{Name: "NoDesc"})
+	resp2 := mcpNoDesc.handleServerDiscover(req)
+	resultMap2, ok := resp2.Result.(map[string]interface{})
+	require.True(t, ok)
+	assert.NotContains(t, resultMap2, "instructions")
+}
+
+func TestHandleToolsList_MCP2Shape(t *testing.T) {
+	engine := gin.New()
+	engine.GET("/tool1", func(c *gin.Context) {})
+	mcp := New(engine, &Config{Name: "ListServer", CacheTTLMs: 30000, CacheScope: "private"})
+	require.NoError(t, mcp.SetupServer())
+
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"list-mcp2"`),
+		Method:  "tools/list",
+		Params:  mcp2Params(nil),
+	}
+	resp := mcp.handleToolsList(req)
+	require.Nil(t, resp.Error)
+	resultMap, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+
+	assert.Equal(t, "complete", resultMap["resultType"])
+	assert.Equal(t, 30000, resultMap["ttlMs"])
+	assert.Equal(t, "private", resultMap["cacheScope"])
+	assert.Contains(t, resultMap, "tools")
+	meta, ok := resultMap["_meta"].(map[string]interface{})
+	require.True(t, ok)
+	serverInfo, ok := meta["io.modelcontextprotocol/serverInfo"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "ListServer", serverInfo["name"])
+}
+
+func TestHandleToolsList_LegacyShapeUnchanged(t *testing.T) {
+	engine := gin.New()
+	engine.GET("/tool1", func(c *gin.Context) {})
+	mcp := New(engine, nil)
+	require.NoError(t, mcp.SetupServer())
+
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"list-legacy"`),
+		Method:  "tools/list",
+	}
+	resp := mcp.handleToolsList(req)
+	require.Nil(t, resp.Error)
+	resultMap, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+
+	assert.Contains(t, resultMap, "tools")
+	assert.Contains(t, resultMap, "metadata")
+	assert.NotContains(t, resultMap, "resultType")
+	assert.NotContains(t, resultMap, "ttlMs")
+	assert.NotContains(t, resultMap, "cacheScope")
+	assert.NotContains(t, resultMap, "_meta")
+}
+
+func TestHandleToolCall_MCP2Shape(t *testing.T) {
+	mcp := New(gin.New(), &Config{Name: "CallServer"})
+	mcp.tools = []types.Tool{{Name: "do_thing"}}
+	mcp.operations["do_thing"] = types.Operation{Method: "GET", Path: "/do"}
+	mcp.executeToolFunc = func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+		return map[string]interface{}{"done": true}, nil
+	}
+
+	req := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"call-mcp2"`),
+		Method:  "tools/call",
+		Params:  mcp2Params(map[string]interface{}{"name": "do_thing", "arguments": map[string]interface{}{}}),
+	}
+	resp := mcp.handleToolCall(req)
+	require.Nil(t, resp.Error)
+	resultMap, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+
+	assert.Equal(t, "complete", resultMap["resultType"])
+	assert.Contains(t, resultMap, "content")
+	meta, ok := resultMap["_meta"].(map[string]interface{})
+	require.True(t, ok)
+	serverInfo, ok := meta["io.modelcontextprotocol/serverInfo"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "CallServer", serverInfo["name"])
+
+	// Legacy request: no MCP2 fields.
+	legacyReq := &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      types.RawMessage(`"call-legacy"`),
+		Method:  "tools/call",
+		Params:  map[string]interface{}{"name": "do_thing", "arguments": map[string]interface{}{}},
+	}
+	legacyResp := mcp.handleToolCall(legacyReq)
+	require.Nil(t, legacyResp.Error)
+	legacyResult, ok := legacyResp.Result.(map[string]interface{})
+	require.True(t, ok)
+	assert.NotContains(t, legacyResult, "resultType")
+	assert.NotContains(t, legacyResult, "_meta")
+	assert.Contains(t, legacyResult, "content")
+}
+
+func TestStreamableHTTP_EndToEnd(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/items/:id", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"id": c.Param("id")})
+	})
+
+	mcp := New(engine, &Config{Name: "E2E", Description: "e2e server"})
+	mcp.executeToolFunc = func(operationID string, parameters map[string]interface{}) (interface{}, error) {
+		return map[string]interface{}{"id": parameters["id"]}, nil
+	}
+	mcp.Mount("/mcp")
+
+	srv := httptest.NewServer(engine)
+	defer srv.Close()
+
+	mcp2Headers := map[string]string{
+		"Content-Type":         "application/json",
+		"MCP-Protocol-Version": ProtocolVersion20260728,
+	}
+	doPost := func(t *testing.T, headers map[string]string, body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewBufferString(body))
+		require.NoError(t, err)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	// (a) server/discover with full MCP2 headers.
+	t.Run("server/discover MCP2", func(t *testing.T) {
+		h := map[string]string{}
+		for k, v := range mcp2Headers {
+			h[k] = v
+		}
+		h["Mcp-Method"] = "server/discover"
+		resp := doPost(t, h, `{"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, ProtocolVersion20260728, resp.Header.Get("MCP-Protocol-Version"))
+
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		result, ok := body["result"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "complete", result["resultType"])
+		assert.Contains(t, result, "supportedVersions")
+		assert.Equal(t, "e2e server", result["instructions"])
+	})
+
+	// (b) tools/call with full MCP2 headers through the transport.
+	t.Run("tools/call MCP2", func(t *testing.T) {
+		h := map[string]string{}
+		for k, v := range mcp2Headers {
+			h[k] = v
+		}
+		h["Mcp-Method"] = "tools/call"
+		h["Mcp-Name"] = "GET_items_id"
+		resp := doPost(t, h, `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"GET_items_id","arguments":{"id":"42"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, ProtocolVersion20260728, resp.Header.Get("MCP-Protocol-Version"))
+
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		result, ok := body["result"].(map[string]interface{})
+		require.True(t, ok, "body: %v", body)
+		assert.Equal(t, "complete", result["resultType"])
+		assert.Contains(t, result, "content")
+	})
+
+	// (c) tools/call MCP2 missing Mcp-Name -> 400 -32020.
+	t.Run("tools/call missing Mcp-Name", func(t *testing.T) {
+		h := map[string]string{}
+		for k, v := range mcp2Headers {
+			h[k] = v
+		}
+		h["Mcp-Method"] = "tools/call"
+		resp := doPost(t, h, `{"jsonrpc":"2.0","id":"c2","method":"tools/call","params":{"name":"GET_items_id","arguments":{"id":"42"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		errObj, ok := body["error"].(map[string]interface{})
+		require.True(t, ok)
+		assert.EqualValues(t, -32020, errObj["code"])
+	})
+
+	// (d) legacy tools/list without any MCP headers.
+	t.Run("tools/list legacy", func(t *testing.T) {
+		resp := doPost(t, map[string]string{"Content-Type": "application/json"},
+			`{"jsonrpc":"2.0","id":"l1","method":"tools/list"}`)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, ProtocolVersion20250326, resp.Header.Get("MCP-Protocol-Version"))
+
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		result, ok := body["result"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Contains(t, result, "tools")
+		assert.NotContains(t, result, "resultType")
+	})
+
+	// (e) GET /mcp is the SSE-session endpoint: 400 without Mcp-Session-Id.
+	t.Run("GET requires Mcp-Session-Id", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/mcp")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
 }

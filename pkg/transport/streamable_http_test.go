@@ -2,31 +2,37 @@ package transport
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ckanthony/gin-mcp/pkg/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // --- Test Setup ---
 
+var testSupportedVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"}
+
 func setupTestStreamableHTTPTransport(mountPath string, allowedOrigins []string) *StreamableHTTPTransport {
 	setGinModeOnce.Do(func() {}) // Already called by sse_test.go if tests run together; safe to call again via Once.
-	return NewStreamableHTTPTransport(mountPath, allowedOrigins)
+	return NewStreamableHTTPTransport(mountPath, allowedOrigins, testSupportedVersions)
 }
 
 // --- Constructor & RegisterHandler ---
 
 func TestNewStreamableHTTPTransport(t *testing.T) {
 	mountPath := "/mcp"
-	s := NewStreamableHTTPTransport(mountPath, nil)
+	s := NewStreamableHTTPTransport(mountPath, nil, testSupportedVersions)
 
 	assert.NotNil(t, s)
 	assert.Equal(t, mountPath, s.mountPath)
@@ -37,11 +43,12 @@ func TestNewStreamableHTTPTransport(t *testing.T) {
 	assert.NotNil(t, s.sessions)
 	assert.Empty(t, s.sessions)
 	assert.Empty(t, s.allowedOrigins)
+	assert.Equal(t, testSupportedVersions, s.supportedProtocolVersions)
 }
 
 func TestNewStreamableHTTPTransport_WithAllowedOrigins(t *testing.T) {
 	origins := []string{"https://app.example.com", "https://other.example.com"}
-	s := NewStreamableHTTPTransport("/mcp", origins)
+	s := NewStreamableHTTPTransport("/mcp", origins, testSupportedVersions)
 
 	assert.NotNil(t, s)
 	assert.Equal(t, origins, s.allowedOrigins)
@@ -95,7 +102,7 @@ func TestStreamableHTTPTransport_IsOriginAllowed(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewStreamableHTTPTransport("/mcp", tc.allowedOrigins)
+			s := NewStreamableHTTPTransport("/mcp", tc.allowedOrigins, testSupportedVersions)
 			got := s.isOriginAllowed(tc.requestOrigin)
 			assert.Equal(t, tc.want, got)
 		})
@@ -117,7 +124,7 @@ func TestStreamableHTTPTransport_CorsOriginHeader(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewStreamableHTTPTransport("/mcp", tc.allowedOrigins)
+			s := NewStreamableHTTPTransport("/mcp", tc.allowedOrigins, testSupportedVersions)
 			got := s.corsOriginHeader(tc.requestOrigin)
 			assert.Equal(t, tc.want, got)
 		})
@@ -209,7 +216,8 @@ func TestStreamableHTTPTransport_HandleMessage_BadRequestBody(t *testing.T) {
 	s.HandleMessage(c)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "Invalid message format")
+	assert.Contains(t, w.Body.String(), `"code":-32700`)
+	assert.Contains(t, w.Body.String(), "Parse error")
 }
 
 func TestStreamableHTTPTransport_HandleMessage_HandlerNotFound(t *testing.T) {
@@ -758,4 +766,295 @@ func TestStreamableHTTPTransport_HandleMessage_ResponseDirectlyInBody(t *testing
 	s.sMu.RLock()
 	assert.Empty(t, s.sessions, "No SSE session should be created for a POST request")
 	s.sMu.RUnlock()
+}
+
+// --- Protocol version negotiation & MCP2 (2026-07-28) header validation ---
+
+// mcp2Body returns a fully valid 2026-07-28 request body for the given method.
+func mcp2Body(method string) string {
+	return `{"jsonrpc":"2.0","id":"1","method":"` + method + `","params":{"_meta":{` +
+		`"io.modelcontextprotocol/protocolVersion":"2026-07-28",` +
+		`"io.modelcontextprotocol/clientCapabilities":{}}}}`
+}
+
+func mcp2Headers(method string) map[string]string {
+	return map[string]string{
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method":           method,
+	}
+}
+
+type rpcErrorBody struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Error   struct {
+		Code    int                    `json:"code"`
+		Message string                 `json:"message"`
+		Data    map[string]interface{} `json:"data"`
+	} `json:"error"`
+}
+
+func postMessage(t *testing.T, tr *StreamableHTTPTransport, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := gin.New()
+	r.POST("/mcp", tr.HandleMessage)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func parseRPCError(t *testing.T, w *httptest.ResponseRecorder) rpcErrorBody {
+	t.Helper()
+	var body rpcErrorBody
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "2.0", body.JSONRPC)
+	return body
+}
+
+func echoHandler(msg *types.MCPMessage) *types.MCPMessage {
+	return &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      msg.ID,
+		Result:  map[string]interface{}{"ok": true},
+	}
+}
+
+func mergeHeaders(base, extra map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+func TestStreamableHTTP_HandleMessage_ProtocolVersions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name           string
+		allowedOrigins []string
+		body           string
+		headers        map[string]string
+		register       map[string]MessageHandler
+		wantStatus     int
+		wantErrCode    int // 0 = no JSON-RPC error expected
+		check          func(t *testing.T, w *httptest.ResponseRecorder)
+	}{
+		{
+			name:           "origin denied -> 403",
+			allowedOrigins: []string{"https://allowed.example.com"},
+			body:           mcp2Body("tools/list"),
+			headers:        mergeHeaders(mcp2Headers("tools/list"), map[string]string{"Origin": "https://evil.example.com"}),
+			wantStatus:     http.StatusForbidden,
+		},
+		{
+			name:           "origin absent -> allowed",
+			allowedOrigins: []string{"https://allowed.example.com"},
+			body:           `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			register:       map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus:     http.StatusOK,
+		},
+		{
+			name:           "origin allowed -> ok",
+			allowedOrigins: []string{"https://allowed.example.com"},
+			body:           `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			headers:        map[string]string{"Origin": "https://allowed.example.com"},
+			register:       map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus:     http.StatusOK,
+		},
+		{
+			name:        "malformed JSON -> -32700",
+			body:        `{"jsonrpc":`,
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32700,
+		},
+		{
+			name:       "no version anywhere -> fallback 2025-03-26 passthrough",
+			body:       `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			register:   map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus: http.StatusOK,
+			check: func(t *testing.T, w *httptest.ResponseRecorder) {
+				assert.Equal(t, "2025-03-26", w.Header().Get("MCP-Protocol-Version"))
+			},
+		},
+		{
+			name:       "header-only legacy version -> ok",
+			body:       `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			headers:    map[string]string{"MCP-Protocol-Version": "2025-06-18"},
+			register:   map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus: http.StatusOK,
+			check: func(t *testing.T, w *httptest.ResponseRecorder) {
+				assert.Equal(t, "2025-06-18", w.Header().Get("MCP-Protocol-Version"))
+			},
+		},
+		{
+			name:        "header 2026-07-28 without _meta -> -32020",
+			body:        `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name: "header != _meta -> -32020",
+			body: `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{"_meta":{` +
+				`"io.modelcontextprotocol/protocolVersion":"2025-06-18"}}}`,
+			headers:     map[string]string{"MCP-Protocol-Version": "2025-11-25"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:        "unsupported version -> -32022 with supported list",
+			body:        `{"jsonrpc":"2.0","id":"1","method":"tools/list"}`,
+			headers:     map[string]string{"MCP-Protocol-Version": "1999-01-01"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32022,
+			check: func(t *testing.T, w *httptest.ResponseRecorder) {
+				body := parseRPCError(t, w)
+				require.NotNil(t, body.Error.Data)
+				assert.Equal(t, "1999-01-01", body.Error.Data["requested"])
+				supported, ok := body.Error.Data["supported"].([]interface{})
+				require.True(t, ok)
+				assert.Len(t, supported, len(testSupportedVersions))
+			},
+		},
+		{
+			name: "MCP2 without clientCapabilities -> -32021",
+			body: `{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{"_meta":{` +
+				`"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`,
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32021,
+		},
+		{
+			name:        "MCP2 missing Mcp-Method -> -32020",
+			body:        mcp2Body("tools/list"),
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:        "MCP2 Mcp-Method invalid chars -> -32020",
+			body:        mcp2Body("tools/list"),
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list\xc3\xa9"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:        "MCP2 Mcp-Method base64 sentinel -> -32020",
+			body:        mcp2Body("tools/list"),
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "=?base64?" + base64.StdEncoding.EncodeToString([]byte("tools/list")) + "?="},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:        "MCP2 Mcp-Method mismatch -> -32020",
+			body:        mcp2Body("tools/list"),
+			headers:     map[string]string{"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call"},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:       "MCP2 Mcp-Method match -> ok",
+			body:       mcp2Body("tools/list"),
+			headers:    mcp2Headers("tools/list"),
+			register:   map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:        "MCP2 tools/call missing Mcp-Name -> -32020",
+			body:        `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"my_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			headers:     mcp2Headers("tools/call"),
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name: "MCP2 tools/call base64 Mcp-Name match -> ok",
+			body: `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"my_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			headers: mergeHeaders(mcp2Headers("tools/call"), map[string]string{
+				"Mcp-Name": "=?base64?" + base64.StdEncoding.EncodeToString([]byte("my_tool")) + "?=",
+			}),
+			register:   map[string]MessageHandler{"tools/call": echoHandler},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "MCP2 tools/call Mcp-Name mismatch -> -32020",
+			body: `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"my_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			headers: mergeHeaders(mcp2Headers("tools/call"), map[string]string{
+				"Mcp-Name": "other_tool",
+			}),
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name: "MCP2 tools/call invalid plain Mcp-Name -> -32020",
+			body: `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"my_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			headers: mergeHeaders(mcp2Headers("tools/call"), map[string]string{
+				"Mcp-Name": "my_tool\xc3\xa9",
+			}),
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: -32020,
+		},
+		{
+			name:       "notification (no id) -> 202 empty",
+			body:       `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+			wantStatus: http.StatusAccepted,
+			check: func(t *testing.T, w *httptest.ResponseRecorder) {
+				assert.Empty(t, w.Body.String())
+			},
+		},
+		{
+			name:       "notification (id null) -> 202",
+			body:       `{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}`,
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name:        "unknown method MCP2 -> 404 -32601",
+			body:        mcp2Body("bogus/method"),
+			headers:     mcp2Headers("bogus/method"),
+			wantStatus:  http.StatusNotFound,
+			wantErrCode: -32601,
+		},
+		{
+			name:        "unknown method legacy -> 200 -32601",
+			body:        `{"jsonrpc":"2.0","id":"1","method":"bogus/method"}`,
+			wantStatus:  http.StatusOK,
+			wantErrCode: -32601,
+		},
+		{
+			name:       "success carries MCP-Protocol-Version header",
+			body:       mcp2Body("tools/list"),
+			headers:    mcp2Headers("tools/list"),
+			register:   map[string]MessageHandler{"tools/list": echoHandler},
+			wantStatus: http.StatusOK,
+			check: func(t *testing.T, w *httptest.ResponseRecorder) {
+				assert.Equal(t, "2026-07-28", w.Header().Get("MCP-Protocol-Version"))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := setupTestStreamableHTTPTransport("/mcp", tt.allowedOrigins)
+			for method, h := range tt.register {
+				tr.RegisterHandler(method, h)
+			}
+			w := postMessage(t, tr, tt.body, tt.headers)
+			assert.Equal(t, tt.wantStatus, w.Code, "body: %s", w.Body.String())
+			if tt.wantErrCode != 0 {
+				body := parseRPCError(t, w)
+				assert.Equal(t, tt.wantErrCode, body.Error.Code)
+			}
+			if tt.check != nil {
+				tt.check(t, w)
+			}
+		})
+	}
 }

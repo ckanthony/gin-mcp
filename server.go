@@ -34,6 +34,7 @@ type GinMCP struct {
 	name              string
 	description       string
 	baseURL           string
+	serverVersion     string
 	tools             []types.Tool
 	operations        map[string]types.Operation
 	transport         transport.Transport
@@ -61,6 +62,21 @@ const (
 	TransportTypeStreamableHTTP TransportType = "streamable-http"
 )
 
+// MCP protocol versions supported by this server.
+const (
+	ProtocolVersion20241105 = "2024-11-05" // legacy HTTP+SSE, deprecated
+	ProtocolVersion20250326 = "2025-03-26"
+	ProtocolVersion20250618 = "2025-06-18"
+	ProtocolVersion20251125 = "2025-11-25" // last version with an initialize handshake
+	ProtocolVersion20260728 = "2026-07-28" // current, stateless
+)
+
+const (
+	defaultServerVersion = "0.1.0"
+	defaultCacheTTLMs    = 60000
+	defaultCacheScope    = "public"
+)
+
 // Config represents the configuration options for GinMCP
 type Config struct {
 	Name              string
@@ -76,8 +92,9 @@ type Config struct {
 	// Default: false (for backward compatibility)
 	ForwardAuthHeaders bool
 	// TransportType selects the MCP transport protocol.
-	// Default: TransportTypeSSE (for backward compatibility).
-	// Use TransportTypeStreamableHTTP for horizontally-scaled deployments.
+	// Default: TransportTypeStreamableHTTP (breaking change from earlier releases which
+	// defaulted to TransportTypeSSE). Set TransportTypeSSE explicitly to opt back into
+	// the legacy SSE transport.
 	TransportType TransportType
 	// AllowedOrigins is an optional list of permitted Origin header values for
 	// Streamable HTTP connections (e.g. ["https://app.example.com"]).
@@ -86,6 +103,17 @@ type Config struct {
 	// Server-to-server requests without an Origin header are always allowed.
 	// Default: nil (all origins permitted — rely on authentication for access control).
 	AllowedOrigins []string
+	// ProtocolVersion pins the server to a single MCP protocol version. Empty means all
+	// versions supported by the selected transport.
+	ProtocolVersion string
+	// ServerVersion is reported in serverInfo. Defaults to "0.1.0".
+	ServerVersion string
+	// CacheTTLMs is the tools/list cache lifetime advertised for protocol version
+	// 2026-07-28. Defaults to 60000.
+	CacheTTLMs int
+	// CacheScope is the tools/list cache scope advertised for protocol version
+	// 2026-07-28. Defaults to "public".
+	CacheScope string
 }
 
 // New creates a new GinMCP instance
@@ -96,12 +124,25 @@ func New(engine *gin.Engine, config *Config) *GinMCP {
 			Description: "MCP server for Gin application",
 		}
 	}
+	if config.TransportType == "" {
+		config.TransportType = TransportTypeStreamableHTTP
+	}
+	if config.ServerVersion == "" {
+		config.ServerVersion = defaultServerVersion
+	}
+	if config.CacheTTLMs == 0 {
+		config.CacheTTLMs = defaultCacheTTLMs
+	}
+	if config.CacheScope == "" {
+		config.CacheScope = defaultCacheScope
+	}
 
 	m := &GinMCP{
 		engine:            engine,
 		name:              config.Name,
 		description:       config.Description,
 		baseURL:           config.BaseURL,
+		serverVersion:     config.ServerVersion,
 		operations:        make(map[string]types.Operation),
 		config:            config,
 		registeredSchemas: make(map[string]types.RegisteredSchemaInfo),
@@ -191,7 +232,7 @@ func (m *GinMCP) Mount(mountPath string) {
 
 	// 2. Create transport and register handlers
 	if m.config.TransportType == TransportTypeStreamableHTTP {
-		m.transport = transport.NewStreamableHTTPTransport(mountPath, m.config.AllowedOrigins)
+		m.transport = transport.NewStreamableHTTPTransport(mountPath, m.config.AllowedOrigins, m.supportedProtocolVersions())
 	} else {
 		m.transport = transport.NewSSETransport(mountPath)
 	}
@@ -199,6 +240,7 @@ func (m *GinMCP) Mount(mountPath string) {
 	m.transport.RegisterHandler("tools/list", m.handleToolsList)
 	m.transport.RegisterHandler("tools/call", m.handleToolCall)
 	m.transport.RegisterHandler("logging/setLevel", m.handleLoggingSetLevel)
+	m.transport.RegisterHandler("server/discover", m.handleServerDiscover)
 
 	// 3. Setup CORS middleware
 	m.engine.Use(func(c *gin.Context) {
@@ -212,8 +254,8 @@ func (m *GinMCP) Mount(mountPath string) {
 			}
 			c.Header("Access-Control-Allow-Origin", "*")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Connection-ID")
-			c.Header("Access-Control-Expose-Headers", "X-Connection-ID")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Connection-ID, MCP-Protocol-Version, Mcp-Method, Mcp-Name")
+			c.Header("Access-Control-Expose-Headers", "X-Connection-ID, MCP-Protocol-Version")
 
 			if c.Request.Method == "OPTIONS" {
 				if isDebugMode() {
@@ -275,7 +317,63 @@ func (m *GinMCP) handleMCPConnection(c *gin.Context) {
 	m.transport.HandleConnection(c)
 }
 
-// handleInitialize handles the initialize request from clients
+// supportedProtocolVersions returns the MCP protocol versions this server accepts.
+// If Config.ProtocolVersion is set, only that pinned version is supported. Otherwise the
+// Streamable HTTP transport supports 2026-07-28 down to 2025-03-26 (newest first), and
+// the SSE transport supports only legacy 2024-11-05.
+func (m *GinMCP) supportedProtocolVersions() []string {
+	if m.config.ProtocolVersion != "" {
+		return []string{m.config.ProtocolVersion}
+	}
+	if m.config.TransportType == TransportTypeSSE {
+		return []string{ProtocolVersion20241105}
+	}
+	return []string{
+		ProtocolVersion20260728,
+		ProtocolVersion20251125,
+		ProtocolVersion20250618,
+		ProtocolVersion20250326,
+	}
+}
+
+// capabilities returns the server capabilities object. Only tools are advertised; there
+// are no resource, prompt, or logging handlers.
+func (m *GinMCP) capabilities() map[string]interface{} {
+	return map[string]interface{}{
+		"tools": map[string]interface{}{
+			"listChanged": false,
+		},
+	}
+}
+
+// serverInfo returns the server identification object.
+func (m *GinMCP) serverInfo() map[string]interface{} {
+	return map[string]interface{}{
+		"name":    m.name,
+		"version": m.serverVersion,
+	}
+}
+
+// requestProtocolVersion extracts the per-request protocol version from
+// params._meta["io.modelcontextprotocol/protocolVersion"]. The transport has already
+// enforced header/_meta equality, so handlers can trust this value.
+func requestProtocolVersion(msg *types.MCPMessage) string {
+	params, ok := msg.Params.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	meta, ok := params["_meta"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	version, _ := meta["io.modelcontextprotocol/protocolVersion"].(string)
+	return version
+}
+
+// handleInitialize handles the legacy initialize handshake. Protocol version 2026-07-28
+// is stateless and has no initialize handshake, so it is never negotiated here: if the
+// client-requested version is supported and initialize-capable it is echoed, otherwise
+// the newest initialize-capable supported version is returned.
 func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 	// Parse initialization parameters
 	params, ok := msg.Params.(map[string]interface{})
@@ -295,41 +393,64 @@ func (m *GinMCP) handleInitialize(msg *types.MCPMessage) *types.MCPMessage {
 		log.Printf("Received initialize request with params: %+v", params)
 	}
 
-	// Return server capabilities with correct structure.
-	// Protocol version matches the transport: Streamable HTTP uses 2025-03-26, SSE uses 2024-11-05.
-	protocolVersion := "2024-11-05"
-	if m.config.TransportType == TransportTypeStreamableHTTP {
-		protocolVersion = "2025-03-26"
+	supported := m.supportedProtocolVersions()
+	requested, _ := params["protocolVersion"].(string)
+
+	chosen := ""
+	for _, v := range supported {
+		if v == requested && v != ProtocolVersion20260728 {
+			chosen = v
+			break
+		}
+	}
+	if chosen == "" {
+		for _, v := range supported {
+			if v != ProtocolVersion20260728 {
+				chosen = v
+				break
+			}
+		}
+	}
+	if chosen == "" {
+		// Only 2026-07-28 is supported (pinned); fall back to the last
+		// initialize-capable version so legacy clients still get a handshake.
+		chosen = ProtocolVersion20251125
+	}
+
+	result := map[string]interface{}{
+		"protocolVersion": chosen,
+		"capabilities":    m.capabilities(),
+		"serverInfo":      m.serverInfo(),
+	}
+	if m.description != "" {
+		result["instructions"] = m.description
 	}
 
 	return &types.MCPMessage{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
-		Result: map[string]interface{}{
-			"protocolVersion": protocolVersion,
-			"capabilities": map[string]interface{}{
-				"tools": map[string]interface{}{
-					"enabled": true,
-					"config": map[string]interface{}{
-						"listChanged": false,
-					},
-				},
-				"prompts": map[string]interface{}{
-					"enabled": false,
-				},
-				"resources": map[string]interface{}{
-					"enabled": true,
-				},
-				"roots": map[string]interface{}{
-					"listChanged": false,
-				},
-			},
-			"serverInfo": map[string]interface{}{
-				"name":       m.name,
-				"version":    "2024-11-05",
-				"apiVersion": "2024-11-05",
-			},
+		Result:  result,
+	}
+}
+
+// handleServerDiscover handles the server/discover RPC: up-front discovery of supported
+// protocol versions, capabilities, and server info without an initialize handshake.
+func (m *GinMCP) handleServerDiscover(msg *types.MCPMessage) *types.MCPMessage {
+	result := map[string]interface{}{
+		"resultType":        "complete",
+		"supportedVersions": m.supportedProtocolVersions(),
+		"capabilities":      m.capabilities(),
+		"_meta": map[string]interface{}{
+			"io.modelcontextprotocol/serverInfo": m.serverInfo(),
 		},
+	}
+	if m.description != "" {
+		result["instructions"] = m.description
+	}
+	return &types.MCPMessage{
+		Jsonrpc: "2.0",
+		ID:      msg.ID,
+		Result:  result,
 	}
 }
 
@@ -348,16 +469,28 @@ func (m *GinMCP) handleToolsList(msg *types.MCPMessage) *types.MCPMessage {
 	}
 
 	// Return tools list with proper format
+	result := map[string]interface{}{
+		"tools": m.tools,
+		"metadata": map[string]interface{}{
+			"version": "2024-11-05",
+			"count":   len(m.tools),
+		},
+	}
+
+	// Protocol version 2026-07-28 adds completion metadata, cache hints, and server info.
+	if requestProtocolVersion(msg) == ProtocolVersion20260728 {
+		result["resultType"] = "complete"
+		result["ttlMs"] = m.config.CacheTTLMs
+		result["cacheScope"] = m.config.CacheScope
+		result["_meta"] = map[string]interface{}{
+			"io.modelcontextprotocol/serverInfo": m.serverInfo(),
+		}
+	}
+
 	return &types.MCPMessage{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
-		Result: map[string]interface{}{
-			"tools": m.tools,
-			"metadata": map[string]interface{}{
-				"version": "2024-11-05",
-				"count":   len(m.tools),
-			},
-		},
+		Result:  result,
 	}
 }
 
@@ -460,19 +593,29 @@ func (m *GinMCP) handleToolCall(msg *types.MCPMessage) *types.MCPMessage {
 	}
 
 	// Construct the success response using the expected content structure
+	result := map[string]interface{}{ // Standard MCP result wrapper
+		"content": []map[string]interface{}{ // Content is an array
+			{
+				"type": string(types.ContentTypeText), // Assuming text response
+				"text": string(resultBytes),           // Actual result as JSON string
+			},
+		},
+		// Add other potential fields like isError=false if needed by spec/client
+		// "isError": false,
+	}
+
+	// Protocol version 2026-07-28 adds completion metadata and server info.
+	if requestProtocolVersion(msg) == ProtocolVersion20260728 {
+		result["resultType"] = "complete"
+		result["_meta"] = map[string]interface{}{
+			"io.modelcontextprotocol/serverInfo": m.serverInfo(),
+		}
+	}
+
 	return &types.MCPMessage{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
-		Result: map[string]interface{}{ // Standard MCP result wrapper
-			"content": []map[string]interface{}{ // Content is an array
-				{
-					"type": string(types.ContentTypeText), // Assuming text response
-					"text": string(resultBytes),           // Actual result as JSON string
-				},
-			},
-			// Add other potential fields like isError=false if needed by spec/client
-			// "isError": false,
-		},
+		Result:  result,
 	}
 }
 
