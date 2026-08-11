@@ -11,15 +11,17 @@ import (
 // where each user has their own dynamic endpoint proxied through Quicknode.
 //
 // Usage:
-//   r := gin.Default()
-//   registerRoutes(r)
-//   configureMCPForQuicknode(r)  // Use this instead of configureMCP(r)
-//   r.Run(":8080")
+//
+//	r := gin.Default()
+//	registerRoutes(r)
+//	configureMCPForQuicknode(r)  // Use this instead of configureMCP(r)
+//	r.Run(":8080")
 //
 // Environment Variables:
-//   QUICKNODE_USER_ENDPOINT - The user's specific endpoint (e.g., "https://user1.quicknode.endpoint.com")
-//   USER_ENDPOINT           - Alternative environment variable name
-//   HOST                    - Host without protocol (will add https://)
+//
+//	QUICKNODE_USER_ENDPOINT - The user's specific endpoint (e.g., "https://user1.quicknode.endpoint.com")
+//	USER_ENDPOINT           - Alternative environment variable name
+//	HOST                    - Host without protocol (will add https://)
 func configureMCPForQuicknode(r *gin.Engine) {
 	mcp := server.New(r, &server.Config{
 		Name:        "Gaming Store API",
@@ -34,7 +36,7 @@ func configureMCPForQuicknode(r *gin.Engine) {
 
 	// Setup dynamic baseURL resolution for Quicknode
 	resolver := server.NewQuicknodeResolver("http://localhost:8080")
-	
+
 	// Override the default tool execution with dynamic baseURL logic
 	mcp.SetExecuteToolFunc(func(operationID string, parameters map[string]interface{}) (interface{}, error) {
 		return mcp.ExecuteToolWithResolver(operationID, parameters, resolver)
@@ -93,7 +95,7 @@ func configureMCPForQuicknodeDirectly(r *gin.Engine) {
 		if userEndpoint == "" {
 			userEndpoint = "http://localhost:8080" // fallback
 		}
-		
+
 		return mcp.ExecuteToolWithDynamicURL(operationID, parameters, userEndpoint)
 	})
 

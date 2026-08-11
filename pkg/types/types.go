@@ -26,7 +26,7 @@ func (m RawMessage) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON sets *m to a copy of data.
 func (m *RawMessage) UnmarshalJSON(data []byte) error {
 	if m == nil {
-		return json.Unmarshal(data, nil)
+		return nil
 	}
 	*m = append((*m)[0:0], data...)
 	return nil
