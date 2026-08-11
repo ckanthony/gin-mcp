@@ -85,6 +85,21 @@ type JSONSchema struct {
 	// Add other JSON Schema fields as needed (e.g., format, enum, etc.)
 }
 
+// FieldMeta describes a single field of a struct, pre-computed at code-generation
+// time so that body schemas can be built without runtime reflection.
+type FieldMeta struct {
+	JSONName    string `json:"jsonName"`
+	Type        string `json:"type"` // "string", "integer", "number", "boolean", "array", "object"
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required"`
+}
+
+// StructMeta holds pre-computed field metadata for a Go struct, keyed by struct name.
+type StructMeta struct {
+	Name   string
+	Fields []FieldMeta
+}
+
 // GetSchema generates a JSON schema map for the given value using reflection.
 // This is a basic implementation; a dedicated library is recommended for complex cases.
 func GetSchema(value interface{}) map[string]interface{} {

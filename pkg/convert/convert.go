@@ -21,6 +21,41 @@ func isDebugMode() bool {
 	return gin.Mode() == gin.DebugMode
 }
 
+// generatedAnnotations holds handler docs that were pre-generated at build time
+// (via cmd/annotate-gen).  Keyed by handler function name, e.g. "listProducts".
+// When set, ConvertRoutesToTools checks this map first and only falls back to
+// on-disk source parsing when a handler is not found here.
+var generatedAnnotations map[string]*HandlerDoc
+
+// SetGeneratedAnnotations injects pre-generated annotation mappings.
+// Multiple packages may call this (via their own annotations_gen.go init());
+// later calls merge into the existing map so @body structs defined in a
+// different package are still resolved.
+func SetGeneratedAnnotations(m map[string]*HandlerDoc) {
+	if generatedAnnotations == nil {
+		generatedAnnotations = m
+		return
+	}
+	for k, v := range m {
+		generatedAnnotations[k] = v
+	}
+}
+
+// generatedStructs holds pre-computed struct field metadata keyed by struct name.
+var generatedStructs map[string]*types.StructMeta
+
+// SetGeneratedStructs injects pre-computed struct metadata for @body resolution.
+// Merges with existing data so structs from different packages accumulate.
+func SetGeneratedStructs(m map[string]*types.StructMeta) {
+	if generatedStructs == nil {
+		generatedStructs = m
+		return
+	}
+	for k, v := range m {
+		generatedStructs[k] = v
+	}
+}
+
 // ConvertRoutesToTools converts Gin routes into a list of MCP Tools and an operation map.
 func ConvertRoutesToTools(routes gin.RoutesInfo, registeredSchemas map[string]types.RegisteredSchemaInfo) ([]types.Tool, map[string]types.Operation) {
 	ttools := make([]types.Tool, 0)
@@ -36,8 +71,15 @@ func ConvertRoutesToTools(routes gin.RoutesInfo, registeredSchemas map[string]ty
 		operationID := strings.ToUpper(route.Method) + strings.ReplaceAll(strings.ReplaceAll(route.Path, "/", "_"), ":", "")
 
 		filePath, handlerName := getHandlerInfo(route.HandlerFunc)
-		// Parse handler function comments
-		handlerDoc, _ := parseHandlerComments(filePath, handlerName)
+
+		// Look up handler annotations: generated map first, then on-disk source
+		var handlerDoc *HandlerDoc
+		if generatedAnnotations != nil {
+			handlerDoc = generatedAnnotations[handlerName]
+		}
+		if handlerDoc == nil {
+			handlerDoc, _ = parseHandlerComments(filePath, handlerName)
+		}
 
 		// Override with custom @operationId if present
 		if handlerDoc != nil && handlerDoc.OperationID != "" {
@@ -75,7 +117,7 @@ func ConvertRoutesToTools(routes gin.RoutesInfo, registeredSchemas map[string]ty
 		}
 
 		// Generate schema for the tool's input
-		inputSchema := generateInputSchema(route, registeredSchemas)
+		inputSchema := generateInputSchema(route, registeredSchemas, handlerDoc)
 
 		// Add parameter descriptions to schema if available
 		if handlerDoc != nil && len(handlerDoc.Params) > 0 {
@@ -119,7 +161,7 @@ var PathParamRegex = regexp.MustCompile(`[:\*]([a-zA-Z0-9_]+)`)
 
 // generateInputSchema creates the JSON schema for the tool's input parameters.
 // This is a simplified version using basic reflection and not an external library.
-func generateInputSchema(route gin.RouteInfo, registeredSchemas map[string]types.RegisteredSchemaInfo) *types.JSONSchema {
+func generateInputSchema(route gin.RouteInfo, registeredSchemas map[string]types.RegisteredSchemaInfo, handlerDoc *HandlerDoc) *types.JSONSchema {
 	// Base schema structure
 	schema := &types.JSONSchema{
 		Type:       "object",
@@ -144,6 +186,7 @@ func generateInputSchema(route gin.RouteInfo, registeredSchemas map[string]types
 
 	// 2. Incorporate Registered Query and Body Types
 	schemaKey := route.Method + " " + route.Path
+	hasRegisteredBody := false
 	if schemaInfo, exists := registeredSchemas[schemaKey]; exists {
 		if isDebugMode() {
 			log.Printf("Using registered schema for %s", schemaKey)
@@ -157,6 +200,17 @@ func generateInputSchema(route gin.RouteInfo, registeredSchemas map[string]types
 		// Reflect Body Parameters (if applicable for method and type exists)
 		if (route.Method == "POST" || route.Method == "PUT" || route.Method == "PATCH") && schemaInfo.BodyType != nil {
 			reflectAndAddProperties(schemaInfo.BodyType, properties, &required, "body")
+			hasRegisteredBody = true
+		}
+	}
+
+	// 3. Incorporate @body struct from generated metadata (fallback when no registered body)
+	if !hasRegisteredBody &&
+		(route.Method == "POST" || route.Method == "PUT" || route.Method == "PATCH") &&
+		handlerDoc != nil && handlerDoc.BodyTypeName != "" &&
+		generatedStructs != nil {
+		if sm, ok := generatedStructs[handlerDoc.BodyTypeName]; ok {
+			addStructMetaToSchema(sm, properties, &required)
 		}
 	}
 
@@ -272,14 +326,33 @@ func reflectAndAddProperties(goType interface{}, properties map[string]*types.JS
 	}
 }
 
+// addStructMetaToSchema adds pre-computed struct field metadata to a JSON schema.
+func addStructMetaToSchema(sm *types.StructMeta, properties map[string]*types.JSONSchema, required *[]string) {
+	for _, fm := range sm.Fields {
+		propSchema := &types.JSONSchema{
+			Type:        fm.Type,
+			Description: fm.Description,
+		}
+		// Array type gets a placeholder items schema.
+		if fm.Type == "array" {
+			propSchema.Items = &types.JSONSchema{Type: "string"}
+		}
+		properties[fm.JSONName] = propSchema
+		if fm.Required {
+			*required = append(*required, fm.JSONName)
+		}
+	}
+}
+
 // HandlerDoc stores function documentation
 type HandlerDoc struct {
-	Summary     string
-	Description string
-	Params      map[string]string
-	Returns     string
-	Tags        []string
-	OperationID string
+	Summary      string
+	Description  string
+	Params       map[string]string
+	Returns      string
+	Tags         []string
+	OperationID  string
+	BodyTypeName string // name of the request-body struct (from @body annotation)
 }
 
 // parseHandlerComments parses function documentation from source code
@@ -291,67 +364,77 @@ func parseHandlerComments(filePath string, handlerName string) (*HandlerDoc, err
 		return nil, err
 	}
 
-	var doc *HandlerDoc
-
 	// Iterate through top-level declarations
 	for _, decl := range f.Decls {
 		if fn, ok := decl.(*ast.FuncDecl); ok {
 			if fn.Name.String() == handlerName {
-				doc = &HandlerDoc{
-					Params: make(map[string]string),
+				if fn.Doc == nil {
+					return nil, nil
 				}
-				if fn.Doc != nil {
-					// Parse comments
-					lines := strings.Split(fn.Doc.Text(), "\n")
-					for _, line := range lines {
-						line = strings.TrimSpace(line)
-						switch {
-						case strings.HasPrefix(line, "@summary"):
-							doc.Summary = strings.TrimSpace(strings.TrimPrefix(line, "@summary"))
-						case strings.HasPrefix(line, "@description"):
-							doc.Description = strings.TrimSpace(strings.TrimPrefix(line, "@description"))
-						case strings.HasPrefix(line, "@param"):
-							paramText := strings.TrimSpace(strings.TrimPrefix(line, "@param"))
-							parts := strings.SplitN(paramText, " ", 2)
-							if len(parts) == 2 {
-								paramName := strings.TrimSpace(parts[0])
-								paramDesc := strings.TrimSpace(parts[1])
-								doc.Params[paramName] = paramDesc
-							}
-						case strings.HasPrefix(line, "@return"):
-							doc.Returns = strings.TrimSpace(strings.TrimPrefix(line, "@return"))
-						case strings.HasPrefix(line, "@tags"):
-							tagsText := strings.TrimSpace(strings.TrimPrefix(line, "@tags"))
-							// Split on spaces and commas, trim whitespace, ignore empty entries
-							var tags []string
-							for _, sep := range []string{",", " "} {
-								parts := strings.Split(tagsText, sep)
-								for _, part := range parts {
-									trimmed := strings.TrimSpace(part)
-									if trimmed != "" && !contains(tags, trimmed) {
-										tags = append(tags, trimmed)
-									}
-								}
-								// After first pass with commas, rejoin and split by spaces
-								if sep == "," {
-									tagsText = strings.Join(tags, " ")
-									tags = []string{}
-								}
-							}
-							doc.Tags = tags
-						case strings.HasPrefix(line, "@operationId"):
-							opID := strings.TrimSpace(strings.TrimPrefix(line, "@operationId"))
-							if opID != "" && doc.OperationID == "" {
-								doc.OperationID = opID
-							}
-						}
-					}
-				}
+				return ParseAnnotationLines(fn.Doc.Text()), nil
 			}
 		}
 	}
 
-	return doc, nil
+	return nil, nil
+}
+
+// ParseAnnotationLines parses annotation tags from a comment text block.
+// Exported so the code generator can reuse the same parsing logic.
+func ParseAnnotationLines(commentText string) *HandlerDoc {
+	doc := &HandlerDoc{
+		Params: make(map[string]string),
+	}
+
+	lines := strings.Split(commentText, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "@summary"):
+			doc.Summary = strings.TrimSpace(strings.TrimPrefix(line, "@summary"))
+		case strings.HasPrefix(line, "@description"):
+			doc.Description = strings.TrimSpace(strings.TrimPrefix(line, "@description"))
+		case strings.HasPrefix(line, "@param"):
+			paramText := strings.TrimSpace(strings.TrimPrefix(line, "@param"))
+			parts := strings.SplitN(paramText, " ", 2)
+			if len(parts) == 2 {
+				paramName := strings.TrimSpace(parts[0])
+				paramDesc := strings.TrimSpace(parts[1])
+				doc.Params[paramName] = paramDesc
+			}
+		case strings.HasPrefix(line, "@return"):
+			doc.Returns = strings.TrimSpace(strings.TrimPrefix(line, "@return"))
+		case strings.HasPrefix(line, "@tags"):
+			tagsText := strings.TrimSpace(strings.TrimPrefix(line, "@tags"))
+			var tags []string
+			for _, sep := range []string{",", " "} {
+				parts := strings.Split(tagsText, sep)
+				for _, part := range parts {
+					trimmed := strings.TrimSpace(part)
+					if trimmed != "" && !contains(tags, trimmed) {
+						tags = append(tags, trimmed)
+					}
+				}
+				if sep == "," {
+					tagsText = strings.Join(tags, " ")
+					tags = []string{}
+				}
+			}
+			doc.Tags = tags
+		case strings.HasPrefix(line, "@operationId"):
+			opID := strings.TrimSpace(strings.TrimPrefix(line, "@operationId"))
+			if opID != "" && doc.OperationID == "" {
+				doc.OperationID = opID
+			}
+		case strings.HasPrefix(line, "@body"):
+			bodyType := strings.TrimSpace(strings.TrimPrefix(line, "@body"))
+			if bodyType != "" && doc.BodyTypeName == "" {
+				doc.BodyTypeName = bodyType
+			}
+		}
+	}
+
+	return doc
 }
 
 func getHandlerInfo(handler gin.HandlerFunc) (string, string) {
@@ -368,9 +451,21 @@ func getHandlerInfo(handler gin.HandlerFunc) (string, string) {
 	fullName := funcInfo.Name()
 	filePath, _ := funcInfo.FileLine(ptr)
 
-	// Extract short function name from full name
+	// Extract short function name from full name.
+	//
+	// fullName can be one of:
+	//   "main.listProducts"                           (top-level function)
+	//   "main.(*Server).login-fm"                     (method value → wrapper)
+	//   "main.(*Server).login"                        (method expression)
+	//   "github.com/foo/bar.(*Controller).Handler-fm" (method value in another package)
+	fullName = strings.TrimSuffix(fullName, "-fm")
 	parts := strings.Split(fullName, ".")
 	shortName := parts[len(parts)-1]
+	// If shortName still carries a receiver suffix like "Controller).Login",
+	// keep only the method name after the closing paren.
+	if idx := strings.LastIndex(shortName, ")"); idx >= 0 {
+		shortName = strings.TrimPrefix(shortName[idx+1:], ".")
+	}
 
 	return filePath, shortName
 }
